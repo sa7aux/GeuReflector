@@ -1207,6 +1207,18 @@ void TrunkLink::handleMsgPeerAudio(std::istream& is)
 
   uint32_t deliver_tg = m_reflector->aliasToLocal(local_tg);
 
+  // Full-duplex: feed this peer's audio into the TG mixer as a non-local
+  // source and let onMixReady() distribute the mix. No TalkerStart gating
+  // (several peers/clients may talk at once). Keep the interest timestamp
+  // so the TG stays alive during long transmissions.
+  if (TGHandler::instance()->fullDuplexForTG(deliver_tg))
+  {
+    m_peer_interested_tgs[local_tg] = std::time(nullptr);
+    m_reflector->feedMeshAudioToMixer(deliver_tg, "t:" + m_section,
+                                      msg.audio());
+    return;
+  }
+
   // Only forward audio if this peer has claimed the TG via TalkerStart
   if (m_peer_active_tgs.find(local_tg) == m_peer_active_tgs.end())
   {

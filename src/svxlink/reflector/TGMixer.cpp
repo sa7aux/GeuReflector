@@ -162,6 +162,16 @@ TGMixer::TGMixer(uint32_t tg, const Async::Config& cfg)
                             static_cast<const uint8_t*>(buf) + size);
         });
   }
+  m_local_encoder = makeEncoder();
+  if (m_local_encoder != nullptr)
+  {
+    m_local_encoder->writeEncodedSamples.connect(
+        [this](const void* buf, int size)
+        {
+          m_cur_local.assign(static_cast<const uint8_t*>(buf),
+                             static_cast<const uint8_t*>(buf) + size);
+        });
+  }
 
   m_tick_timer.setTimeout(static_cast<int>(m_frame_ms));
   m_tick_timer.expired.connect(sigc::mem_fun(*this, &TGMixer::onTick));
@@ -177,10 +187,12 @@ TGMixer::~TGMixer(void)
   m_sources.clear();
   delete m_full_encoder;
   m_full_encoder = nullptr;
+  delete m_local_encoder;
+  m_local_encoder = nullptr;
 } /* TGMixer::~TGMixer */
 
 
-void TGMixer::addSource(const std::string& id)
+void TGMixer::addSource(const std::string& id, bool local)
 {
   if (m_sources.find(id) != m_sources.end())
   {
@@ -188,6 +200,7 @@ void TGMixer::addSource(const std::string& id)
   }
 
   Source* src = new Source;
+  src->is_local = local;
   // Ring cap: prebuffer plus a generous margin so bursts are absorbed.
   size_t cap = m_prebuf_size + m_frame_size * 8;
   if (cap < m_frame_size * 4)
@@ -241,12 +254,12 @@ bool TGMixer::hasSource(const std::string& id) const
 
 
 void TGMixer::writeOpus(const std::string& id,
-                        const std::vector<uint8_t>& opus)
+                        const std::vector<uint8_t>& opus, bool local)
 {
   auto it = m_sources.find(id);
   if (it == m_sources.end())
   {
-    addSource(id);
+    addSource(id, local);
     it = m_sources.find(id);
   }
   Source* src = it->second;
@@ -313,6 +326,8 @@ void TGMixer::onTick(Async::Timer*)
 
   // 1) Pull one frame of PCM from each source, decide which are active.
   std::vector<float> full_sum(m_frame_size, 0.0f);
+  std::vector<float> local_sum(m_frame_size, 0.0f);
+  bool any_local_audio = false;
   struct ActiveFrame { Source* src; const std::string* id; std::vector<float> pcm; };
   std::vector<ActiveFrame> active;
   std::map<Source*, std::vector<float>> frame_of; // active sources' own pcm
@@ -359,6 +374,14 @@ void TGMixer::onTick(Async::Timer*)
       {
         full_sum[i] += pcm[i];
       }
+      if (src->is_local)
+      {
+        any_local_audio = true;
+        for (unsigned i = 0; i < m_frame_size; ++i)
+        {
+          local_sum[i] += pcm[i];
+        }
+      }
     }
     else if (src->active_hangover > 0)
     {
@@ -384,9 +407,18 @@ void TGMixer::onTick(Async::Timer*)
                                  static_cast<int>(m_frame_size));
   }
 
+  // Encode the local-only sub-mix for the mesh (trunk/satellite/twin).
+  m_cur_local.clear();
+  if (any_local_audio && (m_local_encoder != nullptr))
+  {
+    m_local_encoder->writeSamples(local_sum.data(),
+                                  static_cast<int>(m_frame_size));
+  }
+
   MixResult result;
   result.tg = m_tg;
   result.full = m_cur_full;
+  result.local_mix = m_cur_local;
 
   // 3) Per active source: encode full mix minus its own audio. Cap the
   //    number of personalised encodes; overflow sources get the full mix.

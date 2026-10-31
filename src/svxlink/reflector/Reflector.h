@@ -210,6 +210,20 @@ class Reflector : public sigc::trackable
         const ReflectorClient::Filter& filter=ReflectorClient::NoFilter());
 
     /**
+     * @brief   Feed mesh-sourced audio (trunk/satellite/twin) into a TG's
+     *          full-duplex mixer as a non-local source.
+     * @param   tg    The (local/delivery) talk group id
+     * @param   srcid A stable id for the mesh source (e.g. "t:<section>")
+     * @param   audio The raw Opus payload received from the peer
+     *
+     * Called by the link classes when the TG's DUPLEX_MODE is "full"
+     * instead of their normal single-talker relay. The mixed result is
+     * distributed by onMixReady().
+     */
+    void feedMeshAudioToMixer(uint32_t tg, const std::string& srcid,
+                              const std::vector<uint8_t>& audio);
+
+    /**
      * @brief   Get the TG for protocol V1 clients
      * @return  Returns the TG used for protocol V1 clients
      */

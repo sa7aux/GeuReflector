@@ -361,6 +361,15 @@ void SatelliteClient::handleMsgPeerAudio(std::istream& is)
 
   if (msg.audio().empty()) return;
 
+  if (TGHandler::instance()->fullDuplexForTG(msg.tg()))
+  {
+    m_reflector->feedMeshAudioToMixer(
+        msg.tg(),
+        "sc:" + std::to_string(reinterpret_cast<unsigned long>(this)),
+        msg.audio());
+    return;
+  }
+
   MsgUdpAudio udp_msg(msg.audio());
   m_reflector->broadcastUdpMsg(udp_msg,
       ReflectorClient::mkOrFilter(

@@ -87,6 +87,11 @@ struct MixResult
   uint32_t                                            tg = 0;
   std::vector<uint8_t>                                full;
   std::map<std::string, std::vector<uint8_t>>         per_source;
+  // Sum of this reflector's LOCAL sources only (no mesh-sourced audio).
+  // This is what is sent out onto trunk/satellite/twin links: because it
+  // never contains audio received from a link, it can never loop back
+  // through the mesh, and a remote peer never hears its own audio.
+  std::vector<uint8_t>                                local_mix;
 };
 
 
@@ -112,9 +117,12 @@ class TGMixer : public sigc::trackable
 
     /**
      * @brief   Register a new audio source on this TG (idempotent)
-     * @param   id A stable, source-agnostic identity (client id or peer id)
+     * @param   id    A stable, source-agnostic identity (client or peer id)
+     * @param   local true for a local client, false for a mesh-sourced
+     *                stream (trunk/satellite/twin). Only local sources are
+     *                summed into MixResult::local_mix.
      */
-    void addSource(const std::string& id);
+    void addSource(const std::string& id, bool local = true);
 
     /**
      * @brief   Remove a source (e.g. client/link disconnected)
@@ -136,8 +144,11 @@ class TGMixer : public sigc::trackable
      * @brief   Feed one Opus packet from a source into the mix
      * @param   id    The source identity (auto-registered if unknown)
      * @param   opus  The raw Opus payload as received on the wire
+     * @param   local true for a local client, false for a mesh source
+     *                (used only if the source must be auto-registered)
      */
-    void writeOpus(const std::string& id, const std::vector<uint8_t>& opus);
+    void writeOpus(const std::string& id, const std::vector<uint8_t>& opus,
+                   bool local = true);
 
     /**
      * @brief   The talk group id this mixer serves
@@ -163,6 +174,7 @@ class TGMixer : public sigc::trackable
       Async::AudioEncoder*  encoder = nullptr; // for mix-minus-self
       std::deque<float>     ring;              // jitter buffer (PCM)
       bool                  prebuffering = true;
+      bool                  is_local = true;   // local client vs mesh source
       unsigned              active_hangover = 0; // frames since last audio
       std::vector<uint8_t>  cur_out;           // encoder output this frame
     };
@@ -176,7 +188,9 @@ class TGMixer : public sigc::trackable
     unsigned                          m_hangover_frames;
     std::map<std::string, Source*>    m_sources;
     Async::AudioEncoder*              m_full_encoder = nullptr;
+    Async::AudioEncoder*              m_local_encoder = nullptr;
     std::vector<uint8_t>              m_cur_full;      // full-mix enc output
+    std::vector<uint8_t>              m_cur_local;     // local-mix enc output
     Async::Timer                      m_tick_timer;
 
     TGMixer(const TGMixer&);

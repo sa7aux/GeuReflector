@@ -619,6 +619,11 @@ void TwinLink::handleMsgPeerAudio(std::istream& is)
   }
   if (msg.audio().empty()) return;
   const uint32_t tg = msg.tg();
+  if (TGHandler::instance()->fullDuplexForTG(tg))
+  {
+    m_reflector->feedMeshAudioToMixer(tg, "w:twin", msg.audio());
+    return;
+  }
   MsgUdpAudio udp_msg(msg.audio());
   // Deliver to clients with this TG selected AND to passive monitors of it,
   // matching TrunkLink::handleMsgPeerAudio. A plain selected-only TgFilter

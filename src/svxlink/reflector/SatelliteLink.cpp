@@ -405,6 +405,13 @@ void SatelliteLink::handleMsgPeerAudio(std::istream& is)
 
   uint32_t tg = msg.tg();
   if (msg.audio().empty()) return;
+  if (TGHandler::instance()->fullDuplexForTG(tg))
+  {
+    m_reflector->feedMeshAudioToMixer(
+        tg, "s:" + std::to_string(reinterpret_cast<unsigned long>(this)),
+        msg.audio());
+    return;
+  }
   if (m_sat_active_tgs.find(tg) == m_sat_active_tgs.end()) return;
 
   // Broadcast to local clients on the parent — both selected and monitoring.

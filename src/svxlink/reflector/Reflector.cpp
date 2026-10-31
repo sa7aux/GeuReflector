@@ -1434,8 +1434,8 @@ void Reflector::udpDatagramReceived(const IpAddress& addr, uint16_t port,
             TGMixer* mx = getOrCreateMixer(tg);
             if (mx != nullptr)
             {
-              mx->writeOpus(std::to_string(client->clientId()),
-                            msg.audioData());
+              mx->writeOpus("c:" + std::to_string(client->clientId()),
+                            msg.audioData(), /*local=*/true);
             }
           }
           else
@@ -1631,13 +1631,28 @@ TGMixer* Reflector::getOrCreateMixer(uint32_t tg)
 } /* Reflector::getOrCreateMixer */
 
 
+void Reflector::feedMeshAudioToMixer(uint32_t tg, const std::string& srcid,
+                                     const std::vector<uint8_t>& audio)
+{
+  if (audio.empty())
+  {
+    return;
+  }
+  TGMixer* mx = getOrCreateMixer(tg);
+  if (mx != nullptr)
+  {
+    mx->writeOpus(srcid, audio, /*local=*/false);
+  }
+} /* Reflector::feedMeshAudioToMixer */
+
+
 void Reflector::onMixReady(const MixResult& result)
 {
   const TGHandler::ClientSet& clients =
       TGHandler::instance()->clientsForTG(result.tg);
   for (ReflectorClient* c : clients)
   {
-    const std::string id = std::to_string(c->clientId());
+    const std::string id = "c:" + std::to_string(c->clientId());
     auto pit = result.per_source.find(id);
     if (pit != result.per_source.end())
     {
@@ -1655,6 +1670,34 @@ void Reflector::onMixReady(const MixResult& result)
       c->sendUdpMsg(m);
     }
   }
+
+  // Forward this reflector's LOCAL sub-mix out onto the mesh. Because it
+  // contains no mesh-sourced audio it can never loop back and no remote
+  // peer ever hears its own audio. Reuses the same link send paths as the
+  // half-duplex relay. (NOTE: this is single-hop correct; multi-hop
+  // prefix-routed transit of mixed audio is a separate concern.)
+  if (!result.local_mix.empty())
+  {
+    if (m_is_satellite && (m_satellite_client != nullptr))
+    {
+      m_satellite_client->onLocalAudio(result.tg, result.local_mix);
+    }
+    else
+    {
+      for (auto* link : m_trunk_links)
+      {
+        link->onLocalAudio(result.tg, result.local_mix);
+      }
+      for (auto& kv : m_satellite_con_map)
+      {
+        kv.second->onParentAudio(result.tg, result.local_mix);
+      }
+      if (m_twin_link != nullptr)
+      {
+        m_twin_link->onLocalAudio(result.tg, result.local_mix);
+      }
+    }
+  }
 } /* Reflector::onMixReady */
 
 
@@ -1664,7 +1707,7 @@ void Reflector::removeFromAllMixers(ReflectorClient* client)
   {
     return;
   }
-  const std::string id = std::to_string(client->clientId());
+  const std::string id = "c:" + std::to_string(client->clientId());
   for (auto it = m_tg_mixers.begin(); it != m_tg_mixers.end(); )
   {
     TGMixer* mx = it->second;
