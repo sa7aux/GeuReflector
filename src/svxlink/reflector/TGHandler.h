@@ -234,6 +234,42 @@ class TGHandler : public sigc::trackable
      */
     bool fullDuplexForTG(uint32_t tg) const;
 
+    /**
+     * @brief   Idle timeout (seconds) before an automatic QSY is triggered.
+     * @param   tg The talk group id.
+     * @return  AUTO_QSY_AFTER resolved per-TG then GLOBAL; 0 if unset.
+     *
+     * Config driven: a per-TG value in "TG#<tg>" overrides the "GLOBAL"
+     * default. Zero (or unset) means no automatic QSY by time.
+     */
+    time_t autoQsyAfterForTG(uint32_t tg) const;
+
+    /**
+     * @brief   Is automatic (idle) QSY enabled for this talk group?
+     * @param   tg The talk group id.
+     * @return  AUTO_QSY resolved per-TG then GLOBAL. When neither is set the
+     *          legacy default applies: enabled iff AUTO_QSY_AFTER > 0, so
+     *          existing configs keep working unchanged.
+     */
+    bool autoQsyEnabledForTG(uint32_t tg) const;
+
+    /**
+     * @brief   May a client request a (manual/DTMF-92) QSY on this TG?
+     * @param   tg The talk group the requester is currently on.
+     * @return  QSY_ENABLE resolved per-TG then GLOBAL; default true (legacy
+     *          behaviour: manual QSY was always allowed).
+     */
+    bool qsyEnableForTG(uint32_t tg) const;
+
+    /**
+     * @brief   Should an incoming QSY request from a mesh peer be honoured?
+     * @param   tg The (local) talk group the peer QSY refers to.
+     * @return  QSY_FOLLOW resolved per-TG then GLOBAL; default true. When
+     *          false, a trunk/twin/satellite QSY for this TG is ignored and
+     *          local nodes stay put.
+     */
+    bool qsyFollowForTG(uint32_t tg) const;
+
     sigc::signal<void(uint32_t,
       ReflectorClient*, ReflectorClient*)> talkerUpdated;
 
@@ -293,6 +329,9 @@ class TGHandler : public sigc::trackable
     void checkTimers(Async::Timer *t);
     void removeClientP(TGInfo *tg_info, ReflectorClient* client);
     void printTGStatus(void);
+    // Resolve a boolean config key per-TG ("TG#<tg>") then "GLOBAL",
+    // returning def when neither section defines it.
+    bool qsyBoolForTG(uint32_t tg, const char* key, bool def) const;
 };  /* class TGHandler */
 
 

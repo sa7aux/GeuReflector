@@ -235,6 +235,19 @@ class Reflector : public sigc::trackable
      */
     void requestQsy(ReflectorClient *client, uint32_t tg);
 
+    /**
+     * @brief   Apply a QSY request received from a mesh peer.
+     * @param   from_tg The (local) talk group whose nodes should move.
+     * @param   to_tg   The (local) destination talk group.
+     *
+     * Called by TrunkLink/TwinLink/SatelliteLink/SatelliteClient when a
+     * MsgPeerRequestQsy arrives. If QSY_FOLLOW is enabled for from_tg the
+     * reflector re-issues an ordinary MsgRequestQsy to its LOCAL clients on
+     * from_tg only. It is never re-propagated onto the mesh, so it cannot
+     * loop.
+     */
+    void onPeerRequestQsy(uint32_t from_tg, uint32_t to_tg);
+
     Async::EncryptedUdpSocket* udpSocket(void) const { return m_udp_sock; }
 
     uint32_t randomQsyLo(void) const { return m_random_qsy_lo; }
@@ -633,6 +646,10 @@ class Reflector : public sigc::trackable
         Async::HttpServerConnection::DisconnectReason reason);
     void onRequestAutoQsy(uint32_t from_tg);
     uint32_t nextRandomQsyTg(void);
+    // Fan a QSY (from_tg -> to_tg) out to every mesh peer that carries
+    // from_tg, so their local nodes move along. Loop-safe: peers apply it
+    // locally only and never re-propagate.
+    void propagateQsyToMesh(uint32_t from_tg, uint32_t to_tg);
     void ctrlPtyDataReceived(const void *buf, size_t count);
     void cfgUpdated(const std::string& section, const std::string& tag);
     void onTrunkTalkerUpdated(uint32_t tg, std::string old_cs,

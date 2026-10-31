@@ -42,6 +42,9 @@ class SatelliteClient : public sigc::trackable
     void onLocalTalkerStop(uint32_t tg);
     void onLocalAudio(uint32_t tg, const std::vector<uint8_t>& audio);
     void onLocalFlush(uint32_t tg);
+    // Propagate a QSY (from_tg -> to_tg) up to the parent so it moves its
+    // own local nodes on from_tg along.
+    void onLocalQsy(uint32_t from_tg, uint32_t to_tg);
 
     // Send our local roster up to the parent. Caller has already filtered
     // to "this satellite's local clients" (sat_id empty on the wire).
@@ -104,6 +107,7 @@ class SatelliteClient : public sigc::trackable
     void handleMsgPeerFlush(std::istream& is);
     void handleMsgPeerHeartbeat(void);
     void handleMsgPeerNodeList(std::istream& is);
+    void handleMsgPeerRequestQsy(std::istream& is);
     void handleMsgPeerClientConnected(std::istream& is);
     void handleMsgPeerClientDisconnected(std::istream& is);
     void handleMsgPeerClientRx(std::istream& is);

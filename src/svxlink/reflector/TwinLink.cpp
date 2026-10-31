@@ -327,7 +327,14 @@ void TwinLink::onLocalFlush(uint32_t tg)
 {
   if (!isActive()) return;
   sendMsg(MsgPeerFlush(tg));
-} /* TwinLink::onLocalFlush */
+}
+
+
+void TwinLink::onLocalQsy(uint32_t from_tg, uint32_t to_tg)
+{
+  if (!isActive()) return;
+  sendMsg(MsgPeerRequestQsy(from_tg, to_tg));
+} /* TwinLink::onLocalQsy */
 
 
 void TwinLink::onExternalTrunkTalkerStart(uint32_t tg,
@@ -519,6 +526,9 @@ void TwinLink::onFrameReceived(FramedTcpConnection* con,
     case MsgPeerClientStatus::TYPE:
       handleMsgPeerClientStatus(ss);
       break;
+    case MsgPeerRequestQsy::TYPE:
+      handleMsgPeerRequestQsy(ss);
+      break;
     default:
       // Unknown / not-yet-implemented types silently ignored for now
       break;
@@ -607,6 +617,19 @@ void TwinLink::handleMsgPeerTalkerStop(std::istream& is)
   // which broadcasts MsgTalkerStop and MsgUdpFlushSamples to local clients.
   TGHandler::instance()->clearTrunkTalkerForTG(msg.tg());
 } /* TwinLink::handleMsgPeerTalkerStop */
+
+
+void TwinLink::handleMsgPeerRequestQsy(std::istream& is)
+{
+  MsgPeerRequestQsy msg;
+  if (!msg.unpack(is))
+  {
+    geulog::error("twin", "TWIN: Failed to unpack MsgPeerRequestQsy");
+    return;
+  }
+  // Apply locally only (never re-propagated) -> loop-safe.
+  m_reflector->onPeerRequestQsy(msg.fromTg(), msg.toTg());
+} /* TwinLink::handleMsgPeerRequestQsy */
 
 
 void TwinLink::handleMsgPeerAudio(std::istream& is)

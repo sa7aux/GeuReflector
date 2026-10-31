@@ -93,6 +93,10 @@ class TwinLink
     void onLocalAudio(uint32_t tg, const std::vector<uint8_t>& audio);
     void onLocalFlush(uint32_t tg);
 
+    // Propagate a QSY (from_tg -> to_tg) to the twin peer so it moves its
+    // own local nodes on from_tg along.
+    void onLocalQsy(uint32_t from_tg, uint32_t to_tg);
+
     // Called by Reflector when any TrunkLink receives an external
     // trunk-talker start/stop (so we can mirror it to our partner).
     void onExternalTrunkTalkerStart(uint32_t tg,
@@ -172,6 +176,7 @@ class TwinLink
     void handleMsgPeerFlush(std::istream& is);
     void handleMsgPeerHeartbeat(void);
     void handleMsgPeerNodeList(std::istream& is);
+    void handleMsgPeerRequestQsy(std::istream& is);
     void clearPartnerRosterIfInactive(void);
     void handleMsgTwinExtTalkerStart(std::istream& is);
     void handleMsgTwinExtTalkerStop(std::istream& is);

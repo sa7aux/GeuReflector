@@ -688,6 +688,13 @@ void Reflector::requestQsy(ReflectorClient *client, uint32_t tg)
     return;
   }
 
+  if (!TGHandler::instance()->qsyEnableForTG(current_tg))
+  {
+    geulog::info("client", client->callsign(),
+              ": QSY disabled by config for TG #", current_tg);
+    return;
+  }
+
   if (tg == 0)
   {
     tg = nextRandomQsyTg();
@@ -701,6 +708,9 @@ void Reflector::requestQsy(ReflectorClient *client, uint32_t tg)
       ReflectorClient::mkAndFilter(
         ge_v2_client_filter,
         ReflectorClient::TgFilter(current_tg)));
+
+  // Tell mesh peers so their local nodes on current_tg follow the QSY too.
+  propagateQsyToMesh(current_tg, tg);
 } /* Reflector::requestQsy */
 
 
@@ -2124,7 +2134,61 @@ void Reflector::onRequestAutoQsy(uint32_t from_tg)
       ReflectorClient::mkAndFilter(
         ge_v2_client_filter,
         ReflectorClient::TgFilter(from_tg)));
+
+  // Tell mesh peers so their local nodes on from_tg follow the QSY too.
+  propagateQsyToMesh(from_tg, tg);
 } /* Reflector::onRequestAutoQsy */
+
+
+void Reflector::propagateQsyToMesh(uint32_t from_tg, uint32_t to_tg)
+{
+    // Same fan-out topology as the talker-start/audio mesh path. Each link
+    // applies its own shared/cluster/interest/mapping filter on from_tg and
+    // only sends to a peer that actually carries that TG.
+  if (m_is_satellite && (m_satellite_client != nullptr))
+  {
+    m_satellite_client->onLocalQsy(from_tg, to_tg);
+  }
+  else
+  {
+    for (auto* link : m_trunk_links)
+    {
+      link->onLocalQsy(from_tg, to_tg);
+    }
+    for (auto& kv : m_satellite_con_map)
+    {
+      kv.second->onParentQsy(from_tg, to_tg);
+    }
+    if (m_twin_link != nullptr)
+    {
+      m_twin_link->onLocalQsy(from_tg, to_tg);
+    }
+  }
+} /* Reflector::propagateQsyToMesh */
+
+
+void Reflector::onPeerRequestQsy(uint32_t from_tg, uint32_t to_tg)
+{
+  if ((from_tg == 0) || (to_tg == 0))
+  {
+    return;
+  }
+  if (!TGHandler::instance()->qsyFollowForTG(from_tg))
+  {
+    geulog::info("core", "Ignoring mesh QSY for TG #", from_tg,
+                 " (QSY_FOLLOW disabled)");
+    return;
+  }
+  geulog::info("core", "Applying mesh QSY from TG #", from_tg,
+               " to TG #", to_tg);
+    // Local clients only. This is deliberately NOT re-propagated onto the
+    // mesh, so a QSY can never loop around a cyclic trunk topology. Remote
+    // nodes get their own copy directly from the originating reflector.
+  broadcastMsg(MsgRequestQsy(to_tg),
+      ReflectorClient::mkAndFilter(
+        ge_v2_client_filter,
+        ReflectorClient::TgFilter(from_tg)));
+} /* Reflector::onPeerRequestQsy */
 
 
 uint32_t Reflector::nextRandomQsyTg(void)

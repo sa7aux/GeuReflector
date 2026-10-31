@@ -172,9 +172,7 @@ bool TGHandler::switchTo(ReflectorClient *client, uint32_t tg)
         return false;
       }
       tg_info = new TGInfo(tg);
-      std::ostringstream ss;
-      ss << "TG#" << tg;
-      m_cfg->getValue(ss.str(), "AUTO_QSY_AFTER", tg_info->auto_qsy_after_s);
+      tg_info->auto_qsy_after_s = autoQsyAfterForTG(tg);
       m_id_map[tg] = tg_info;
     }
     tg_info->clients.insert(client);
@@ -240,7 +238,7 @@ void TGHandler::setTalkerForTG(uint32_t tg, ReflectorClient* new_talker)
   }
   talkerUpdated(tg, old_talker, new_talker);
 
-  if (tg_info->auto_qsy_after_s > 0)
+  if ((tg_info->auto_qsy_after_s > 0) && autoQsyEnabledForTG(tg_info->id))
   {
     time_t now = time(NULL);
     if ((new_talker == 0) && (now > tg_info->auto_qsy_time))
@@ -520,6 +518,72 @@ bool TGHandler::fullDuplexForTG(uint32_t tg) const
                  [](unsigned char c){ return std::tolower(c); });
   return mode == "full";
 } /* TGHandler::fullDuplexForTG */
+
+
+bool TGHandler::qsyBoolForTG(uint32_t tg, const char* key, bool def) const
+{
+    // Per-TG value overrides the global default; neither set -> def.
+  std::ostringstream ss;
+  ss << "TG#" << tg;
+  bool v = def;
+  if (m_cfg->getValue(ss.str(), key, v))
+  {
+    return v;
+  }
+  if (m_cfg->getValue("GLOBAL", key, v))
+  {
+    return v;
+  }
+  return def;
+} /* TGHandler::qsyBoolForTG */
+
+
+time_t TGHandler::autoQsyAfterForTG(uint32_t tg) const
+{
+    // Per-TG value overrides the global default; neither set -> 0 (disabled).
+  std::ostringstream ss;
+  ss << "TG#" << tg;
+  time_t after = 0;
+  if (m_cfg->getValue(ss.str(), "AUTO_QSY_AFTER", after))
+  {
+    return after;
+  }
+  after = 0;
+  m_cfg->getValue("GLOBAL", "AUTO_QSY_AFTER", after);
+  return after;
+} /* TGHandler::autoQsyAfterForTG */
+
+
+bool TGHandler::autoQsyEnabledForTG(uint32_t tg) const
+{
+    // Explicit AUTO_QSY (per-TG then GLOBAL) wins. When neither is set, keep
+    // the legacy behaviour: auto QSY is active whenever an AUTO_QSY_AFTER
+    // time is configured. This preserves existing setups byte-for-byte.
+  std::ostringstream ss;
+  ss << "TG#" << tg;
+  bool v = true;
+  if (m_cfg->getValue(ss.str(), "AUTO_QSY", v))
+  {
+    return v;
+  }
+  if (m_cfg->getValue("GLOBAL", "AUTO_QSY", v))
+  {
+    return v;
+  }
+  return autoQsyAfterForTG(tg) > 0;
+} /* TGHandler::autoQsyEnabledForTG */
+
+
+bool TGHandler::qsyEnableForTG(uint32_t tg) const
+{
+  return qsyBoolForTG(tg, "QSY_ENABLE", true);
+} /* TGHandler::qsyEnableForTG */
+
+
+bool TGHandler::qsyFollowForTG(uint32_t tg) const
+{
+  return qsyBoolForTG(tg, "QSY_FOLLOW", true);
+} /* TGHandler::qsyFollowForTG */
 
 
 /****************************************************************************

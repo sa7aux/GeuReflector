@@ -2145,6 +2145,37 @@ class MsgPeerTgInterest : public ReflectorMsgBase<129>
 }; /* MsgPeerTgInterest */
 
 
+/**
+@brief Peer QSY request propagation (geureflector full-duplex extension, type 130)
+@date  2026-10-31
+
+Sent over trunk/twin/satellite links when a QSY is triggered locally (either an
+automatic idle QSY or a client/DTMF-92 requested QSY) so that meshed reflectors
+move their own local nodes on the same talk group along with it. The receiving
+reflector, if it honours incoming QSY (QSY_FOLLOW), re-issues an ordinary
+MsgRequestQsy to its LOCAL clients on from_tg only; it never re-propagates the
+peer message, so it can never loop. Older peers silently ignore this unknown
+message type (see the default case in each link's frame dispatcher), so an old
+(half-only) reflector and a new one remain fully interoperable on the wire.
+
+Both talk group numbers are carried in the same wire form as audio/talker
+messages on the link (subject to the link's TG mapping/aliasing).
+*/
+class MsgPeerRequestQsy : public ReflectorMsgBase<130>
+{
+  public:
+    MsgPeerRequestQsy(void) : m_from_tg(0), m_to_tg(0) {}
+    MsgPeerRequestQsy(uint32_t from_tg, uint32_t to_tg)
+      : m_from_tg(from_tg), m_to_tg(to_tg) {}
+    uint32_t fromTg(void) const { return m_from_tg; }
+    uint32_t toTg(void)   const { return m_to_tg; }
+    ASYNC_MSG_MEMBERS(m_from_tg, m_to_tg)
+  private:
+    uint32_t m_from_tg;   // TG whose nodes are being moved
+    uint32_t m_to_tg;     // destination TG
+}; /* MsgPeerRequestQsy */
+
+
 #endif /* REFLECTOR_MSG_INCLUDED */
 
 

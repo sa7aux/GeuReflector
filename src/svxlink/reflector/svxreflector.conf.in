@@ -28,6 +28,23 @@ LISTEN_PORT=5300
 #MIX_JITTER_MS=60
 #MIX_MAX_TALKERS=4
 #MIX_SOURCE_TIMEOUT_MS=10000
+# QSY (change talk group) behaviour. All keys are global defaults here and
+# are overridable per talk group in a [TG#<n>] section.
+#   AUTO_QSY        1/0 — enable automatic idle QSY. When unset the legacy
+#                   rule applies: auto QSY is active whenever AUTO_QSY_AFTER>0,
+#                   so existing configs are unaffected.
+#   AUTO_QSY_AFTER  seconds of idle before an automatic QSY is triggered
+#                   (0 = never). Needs RANDOM_QSY_RANGE set.
+#   QSY_ENABLE      1/0 — allow client/DTMF-92 requested QSY. Default 1.
+#   QSY_FOLLOW      1/0 — honour a QSY received from a trunk/twin/satellite
+#                   peer (move our own local nodes along). Default 1.
+# When a QSY is triggered it is now also propagated across trunk/twin/
+# satellite links so meshed reflectors move their nodes on the same TG too
+# (loop-safe, single application per peer; old peers ignore it).
+#AUTO_QSY=1
+#AUTO_QSY_AFTER=300
+#QSY_ENABLE=1
+#QSY_FOLLOW=1
 TG_FOR_V1_CLIENTS=999
 #LOCAL_PREFIX=1
 # LOCAL_ALIASES — re-home short local TGs under an owned prefix so they are
@@ -97,7 +114,11 @@ CERT_CA_HOOK=@SVX_SHARE_INSTALL_DIR@/ca-hook.py
 #SM3XYZ="A strong password"
 
 #[TG#9999]
+# Per-TG QSY overrides (fall back to the [GLOBAL] values above).
+#AUTO_QSY=1
 #AUTO_QSY_AFTER=300
+#QSY_ENABLE=1
+#QSY_FOLLOW=1
 #ALLOW=S[A-M]\\\\d.*|LA8PV
 #ALLOW_MONITOR=S[A-M]3.*
 #SHOW_ACTIVITY=0

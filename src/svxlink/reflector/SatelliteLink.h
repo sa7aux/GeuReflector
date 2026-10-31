@@ -52,6 +52,9 @@ class SatelliteLink : public sigc::trackable
     void onParentTalkerStart(uint32_t tg, const std::string& callsign);
     void onParentTalkerStop(uint32_t tg);
     void onParentAudio(uint32_t tg, const std::vector<uint8_t>& audio);
+    // Propagate a QSY (from_tg -> to_tg) down to this satellite so it moves
+    // its own local nodes on from_tg along.
+    void onParentQsy(uint32_t from_tg, uint32_t to_tg);
     void onParentFlush(uint32_t tg);
 
     // Send a node list down to the satellite. Caller passes the combined
@@ -115,6 +118,7 @@ class SatelliteLink : public sigc::trackable
     void handleMsgPeerHeartbeat(void);
     void handleMsgPeerFilter(std::istream& is);
     void handleMsgPeerNodeList(std::istream& is);
+    void handleMsgPeerRequestQsy(std::istream& is);
     void handleMsgPeerClientConnected(std::istream& is);
     void handleMsgPeerClientDisconnected(std::istream& is);
     void handleMsgPeerClientRx(std::istream& is);

@@ -859,6 +859,56 @@ void TrunkLink::onLocalFlush(uint32_t tg)
 } /* TrunkLink::onLocalFlush */
 
 
+void TrunkLink::onLocalQsy(uint32_t from_tg, uint32_t to_tg)
+{
+  if (!isActive()) return;
+  uint32_t rfrom = m_reflector->aliasToRoute(from_tg);
+  if (isBlacklisted(rfrom) || !isAllowed(rfrom)) return;
+  bool mapped = m_tg_map_out.count(rfrom) > 0;
+  if (!mapped &&
+      !isSharedTG(rfrom) && !m_reflector->isClusterTG(rfrom) &&
+      !isPeerInterestedTG(rfrom))
+  {
+    return;
+  }
+  uint32_t rto = m_reflector->aliasToRoute(to_tg);
+  sendMsg(MsgPeerRequestQsy(mapTgOut(rfrom), mapTgOut(rto)));
+} /* TrunkLink::onLocalQsy */
+
+
+void TrunkLink::handleMsgPeerRequestQsy(std::istream& is)
+{
+  MsgPeerRequestQsy msg;
+  if (!msg.unpack(is))
+  {
+    geulog::error("trunk", "[", m_section, "] Failed to unpack MsgPeerRequestQsy");
+    return;
+  }
+
+  uint32_t wire_from = msg.fromTg();
+  uint32_t local_from = mapTgIn(wire_from);
+  if (isBlacklisted(wire_from) || isBlacklisted(local_from) ||
+      !isAllowed(wire_from))
+  {
+    return;
+  }
+  bool mapped = m_tg_map_in.count(wire_from) > 0;
+  if (!mapped && !isOwnedTG(wire_from) && !m_reflector->isClusterTG(wire_from) &&
+      !m_reflector->hasPrefixRoute(wire_from) && !matchesRoutable(wire_from))
+  {
+    return;
+  }
+
+  uint32_t deliver_from = m_reflector->aliasToLocal(local_from);
+  uint32_t deliver_to   = m_reflector->aliasToLocal(mapTgIn(msg.toTg()));
+
+  // Apply locally only. Deliberately not re-forwarded to other peers so a
+  // QSY can never loop in a cyclic trunk topology; each reflector gets its
+  // own copy directly from the originator.
+  m_reflector->onPeerRequestQsy(deliver_from, deliver_to);
+} /* TrunkLink::handleMsgPeerRequestQsy */
+
+
 void TrunkLink::scheduleTgInterestRefresh(
     const std::set<uint32_t>& local_interest)
 {
@@ -1003,6 +1053,9 @@ void TrunkLink::onFrameReceived(FramedTcpConnection* con,
       break;
     case MsgPeerTgInterest::TYPE:
       handleMsgPeerTgInterest(ss);
+      break;
+    case MsgPeerRequestQsy::TYPE:
+      handleMsgPeerRequestQsy(ss);
       break;
     default:
       geulog::warn("trunk", "[", m_section, "] Unknown trunk message type=",
@@ -1712,6 +1765,9 @@ void TrunkLink::onPairedInboundFrame(Async::FramedTcpConnection* con,
           break;
         case MsgPeerTgInterest::TYPE:
           handleMsgPeerTgInterest(ss);
+          break;
+        case MsgPeerRequestQsy::TYPE:
+          handleMsgPeerRequestQsy(ss);
           break;
         default:
           geulog::warn("trunk", "[", m_section, "] Unknown trunk message type=",

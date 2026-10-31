@@ -798,6 +798,9 @@ The PTY path is set by `COMMAND_PTY` in `[GLOBAL]` (default
 - [`docs/FULL_DUPLEX.md`](docs/FULL_DUPLEX.md) — full-duplex talk groups
   (`DUPLEX_MODE=full`): per-TG audio mixing so several nodes can talk at once,
   the `MIX_*` tuning settings, and the behaviour caveats
+- [`docs/QSY.md`](docs/QSY.md) — QSY across the mesh (`AUTO_QSY`,
+  `AUTO_QSY_AFTER`, `QSY_ENABLE`, `QSY_FOLLOW`): global default + per-TG, and
+  trunk/twin/satellite propagation so meshed reflectors move their nodes along
 - [`docs/INSTALL.md`](docs/INSTALL.md) — how to build and install GeuReflector
   as a drop-in replacement for an existing SvxReflector installation
 - [`docs/DOCKER.md`](docs/DOCKER.md) — running GeuReflector in a Docker container

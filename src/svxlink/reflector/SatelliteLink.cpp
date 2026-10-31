@@ -203,6 +203,14 @@ void SatelliteLink::onParentFlush(uint32_t tg)
 } /* SatelliteLink::onParentFlush */
 
 
+void SatelliteLink::onParentQsy(uint32_t from_tg, uint32_t to_tg)
+{
+  if (!m_hello_received) return;
+  if (!filterPassesTg(from_tg)) return;
+  sendMsg(MsgPeerRequestQsy(from_tg, to_tg));
+} /* SatelliteLink::onParentQsy */
+
+
 void SatelliteLink::onFrameReceived(FramedTcpConnection* con,
                                      std::vector<uint8_t>& data)
 {
@@ -265,6 +273,9 @@ void SatelliteLink::onFrameReceived(FramedTcpConnection* con,
       break;
     case MsgPeerClientStatus::TYPE:
       handleMsgPeerClientStatus(ss);
+      break;
+    case MsgPeerRequestQsy::TYPE:
+      handleMsgPeerRequestQsy(ss);
       break;
     default:
       geulog::warn("satellite", "Unknown message type=", header.type());
@@ -377,6 +388,15 @@ void SatelliteLink::handleMsgPeerTalkerStart(std::istream& is)
 
   statusChanged(this);
 } /* SatelliteLink::handleMsgPeerTalkerStart */
+
+
+void SatelliteLink::handleMsgPeerRequestQsy(std::istream& is)
+{
+  MsgPeerRequestQsy msg;
+  if (!msg.unpack(is)) return;
+  // Apply locally only (never re-propagated) -> loop-safe.
+  m_reflector->onPeerRequestQsy(msg.fromTg(), msg.toTg());
+} /* SatelliteLink::handleMsgPeerRequestQsy */
 
 
 void SatelliteLink::handleMsgPeerTalkerStop(std::istream& is)

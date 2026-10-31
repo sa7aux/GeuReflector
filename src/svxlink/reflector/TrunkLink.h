@@ -164,6 +164,11 @@ class TrunkLink : public sigc::trackable
     // Called by Reflector when a local talker's audio stream ends
     void onLocalFlush(uint32_t tg);
 
+    // Called by Reflector to propagate a QSY (from_tg -> to_tg) to this peer,
+    // so the peer moves its own local nodes on from_tg along. Subject to the
+    // same shared/cluster/interest/mapping routing as onLocalTalkerStart.
+    void onLocalQsy(uint32_t from_tg, uint32_t to_tg);
+
     // Send the local node list (callsign + current TG per local client)
     // to the peer. Called from Reflector after debounce.
     void sendNodeList(const std::vector<MsgPeerNodeList::NodeEntry>& nodes);
@@ -303,6 +308,7 @@ class TrunkLink : public sigc::trackable
     void handleMsgPeerHeartbeat(void);
     void handleMsgPeerNodeList(std::istream& is);
     void handleMsgPeerTgInterest(std::istream& is);
+    void handleMsgPeerRequestQsy(std::istream& is);
 
     // force=true bypasses skip-when-unchanged so the periodic 60 s
     // heartbeat refreshes the receiver's m_peer_interested_tgs TTL.

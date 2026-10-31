@@ -188,6 +188,14 @@ void SatelliteClient::onLocalFlush(uint32_t tg)
 } /* SatelliteClient::onLocalFlush */
 
 
+void SatelliteClient::onLocalQsy(uint32_t from_tg, uint32_t to_tg)
+{
+  if (!m_con.isConnected() || !m_hello_received) return;
+  if (!m_filter.empty() && !m_filter.matches(from_tg)) return;
+  sendMsg(MsgPeerRequestQsy(from_tg, to_tg));
+} /* SatelliteClient::onLocalQsy */
+
+
 void SatelliteClient::onConnected(void)
 {
   geulog::info("satellite", "Connected to parent ", m_con.remoteHost(),
@@ -283,6 +291,9 @@ void SatelliteClient::onFrameReceived(FramedTcpConnection* con,
     case MsgPeerClientStatus::TYPE:
       handleMsgPeerClientStatus(ss);
       break;
+    case MsgPeerRequestQsy::TYPE:
+      handleMsgPeerRequestQsy(ss);
+      break;
     default:
       break;
   }
@@ -331,6 +342,15 @@ void SatelliteClient::sendFilter(void)
   sendMsg(MsgPeerFilter(m_filter_str));
   geulog::info("satellite", "Sent TG filter to parent: ", m_filter_str);
 } /* SatelliteClient::sendFilter */
+
+
+void SatelliteClient::handleMsgPeerRequestQsy(std::istream& is)
+{
+  MsgPeerRequestQsy msg;
+  if (!msg.unpack(is)) return;
+  // Apply locally only (never re-propagated) -> loop-safe.
+  m_reflector->onPeerRequestQsy(msg.fromTg(), msg.toTg());
+} /* SatelliteClient::handleMsgPeerRequestQsy */
 
 
 void SatelliteClient::handleMsgPeerTalkerStart(std::istream& is)
