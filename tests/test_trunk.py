@@ -1,0 +1,3570 @@
+#!/usr/bin/env python3
+"""Integration tests for GeuReflector trunk protocol.
+
+Connects as a fake trunk peer via the TRUNK_TEST config section and exercises
+routing, audio relay, cluster TG broadcast, and heartbeat.
+
+Topology (prefixes, ports, secrets) is defined in topology.py — edit there
+and run `python3 generate_configs.py` to regenerate configs + compose file.
+
+Requires: Python 3.7+, stdlib only (+ topology.py from this directory).
+"""
+
+import hashlib
+import hmac
+import json
+import os
+import re
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+import unittest
+from urllib.request import urlopen
+from urllib.error import URLError
+
+import paho.mqtt.client as mqtt_client
+
+# Ensure tests/ is on the path so topology can be imported
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import topology as T
+
+# ---------------------------------------------------------------------------
+# Derived endpoints from topology
+# ---------------------------------------------------------------------------
+HOST = "127.0.0.1"
+
+def _trunk(name):
+    return (HOST, T.mapped_trunk_port(name))
+
+def _http(name):
+    return (HOST, T.mapped_http_port(name))
+
+REFLECTOR_NAMES = sorted(T.REFLECTORS)
+
+TEST_SECRET = T.TEST_PEER["secret"]
+TEST_PREFIX = T.prefix_str(T.TEST_PEER["prefix"])  # comma-separated for handshake
+TEST_PREFIX_FIRST = T.first_prefix(T.TEST_PEER["prefix"])  # first prefix for TG generation
+
+TEST_RX_SECRET = T.TEST_PEER_RX["secret"]
+TEST_RX_PREFIX = T.prefix_str(T.TEST_PEER_RX["prefix"])
+
+SAT_SECRET = T.SATELLITE["secret"]
+SAT_ID = T.SATELLITE["id"]
+ROLE_SATELLITE = 1
+
+# V2 client auth credentials (must match [USERS]/[PASSWORDS] in configs)
+CLIENT_CALLSIGN = T.TEST_CLIENTS[0]["callsign"]
+CLIENT_PASSWORD = T.TEST_CLIENTS[0]["password"]
+CLIENT2_CALLSIGN = T.TEST_CLIENTS[1]["callsign"]
+CLIENT2_PASSWORD = T.TEST_CLIENTS[1]["password"]
+CLIENT3_CALLSIGN = T.TEST_CLIENTS[2]["callsign"]
+CLIENT3_PASSWORD = T.TEST_CLIENTS[2]["password"]
+
+# Trunk message types
+MSG_TRUNK_HELLO = 115
+MSG_TRUNK_TALKER_START = 116
+MSG_TRUNK_TALKER_STOP = 117
+MSG_TRUNK_AUDIO = 118
+MSG_TRUNK_FLUSH = 119
+MSG_TRUNK_HEARTBEAT = 120
+MSG_TRUNK_NODE_LIST = 121
+MSG_TRUNK_FILTER = 122
+
+# Filter test peer constants
+FILTER_SECRET = T.TEST_PEER_FILTER["secret"]
+FILTER_PREFIX = T.prefix_str(T.TEST_PEER_FILTER["prefix"])
+
+# ---------------------------------------------------------------------------
+# Wire format helpers
+# ---------------------------------------------------------------------------
+
+def pack_string(s: str) -> bytes:
+    b = s.encode("utf-8")
+    return struct.pack("!H", len(b)) + b
+
+
+def unpack_string(data: bytes, offset: int):
+    length = struct.unpack_from("!H", data, offset)[0]
+    s = data[offset + 2 : offset + 2 + length].decode("utf-8")
+    return s, offset + 2 + length
+
+
+def pack_vec_u8(v: bytes) -> bytes:
+    return struct.pack("!H", len(v)) + v
+
+
+def unpack_vec_u8(data: bytes, offset: int):
+    count = struct.unpack_from("!H", data, offset)[0]
+    return data[offset + 2 : offset + 2 + count], offset + 2 + count
+
+
+def send_frame(sock, payload: bytes):
+    sock.sendall(struct.pack("!I", len(payload)) + payload)
+
+
+def recv_exact(sock, n: int) -> bytes:
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError("connection closed")
+        buf += chunk
+    return buf
+
+
+def recv_frame(sock) -> bytes:
+    hdr = recv_exact(sock, 4)
+    length = struct.unpack("!I", hdr)[0]
+    return recv_exact(sock, length)
+
+
+# ---------------------------------------------------------------------------
+# Message builders
+# ---------------------------------------------------------------------------
+
+def build_trunk_hello(trunk_id: str, local_prefix: str, priority: int,
+                      secret: str, role: int = 0) -> bytes:
+    nonce = os.urandom(20)
+    digest = hmac.new(secret.encode(), nonce, hashlib.sha1).digest()
+    payload = struct.pack("!H", MSG_TRUNK_HELLO)
+    payload += pack_string(trunk_id)
+    payload += pack_string(local_prefix)
+    payload += struct.pack("!I", priority)
+    payload += pack_vec_u8(nonce)
+    payload += pack_vec_u8(digest)
+    payload += struct.pack("!B", role)
+    return payload
+
+
+def build_talker_start(tg: int, callsign: str) -> bytes:
+    payload = struct.pack("!H", MSG_TRUNK_TALKER_START)
+    payload += struct.pack("!I", tg)
+    payload += pack_string(callsign)
+    return payload
+
+
+def build_talker_stop(tg: int) -> bytes:
+    payload = struct.pack("!H", MSG_TRUNK_TALKER_STOP)
+    payload += struct.pack("!I", tg)
+    return payload
+
+
+def build_audio(tg: int, audio: bytes) -> bytes:
+    payload = struct.pack("!H", MSG_TRUNK_AUDIO)
+    payload += struct.pack("!I", tg)
+    payload += pack_vec_u8(audio)
+    return payload
+
+
+def build_flush(tg: int) -> bytes:
+    payload = struct.pack("!H", MSG_TRUNK_FLUSH)
+    payload += struct.pack("!I", tg)
+    return payload
+
+
+def build_heartbeat() -> bytes:
+    return struct.pack("!H", MSG_TRUNK_HEARTBEAT)
+
+
+def build_trunk_filter(filter_str: str) -> bytes:
+    payload = struct.pack("!H", MSG_TRUNK_FILTER)
+    payload += pack_string(filter_str)
+    return payload
+
+
+def build_node_list(nodes) -> bytes:
+    """Build a MsgTrunkNodeList frame.
+
+    `nodes` is an iterable of (callsign, tg[, lat, lon, qth_name[, status_blob, sat_id]])
+    tuples. Unspecified fields default to 0.0/"". Wire layout: 7 vectors
+    (callsigns, tgs, lats, lons, qth_names, status_blobs, sat_ids), each
+    prefixed with a u16 element count.
+    """
+    norm = []
+    for n in nodes:
+        if len(n) == 2:
+            cs, tg = n
+            lat, lon, qth, blob, sat_id = 0.0, 0.0, "", "", ""
+        elif len(n) == 5:
+            cs, tg, lat, lon, qth = n
+            blob, sat_id = "", ""
+        elif len(n) == 7:
+            cs, tg, lat, lon, qth, blob, sat_id = n
+        else:
+            raise ValueError("node tuple must be (cs,tg), (cs,tg,lat,lon,qth) "
+                             "or (cs,tg,lat,lon,qth,blob,sat_id)")
+        norm.append((cs, tg, lat, lon, qth, blob, sat_id))
+
+    payload = struct.pack("!H", MSG_TRUNK_NODE_LIST)
+    payload += struct.pack("!H", len(norm))
+    for cs, *_ in norm:
+        payload += pack_string(cs)
+    payload += struct.pack("!H", len(norm))
+    for _cs, tg, *_ in norm:
+        payload += struct.pack("!I", tg)
+    payload += struct.pack("!H", len(norm))
+    for _cs, _tg, lat, *_ in norm:
+        payload += struct.pack("!f", lat)
+    payload += struct.pack("!H", len(norm))
+    for _cs, _tg, _lat, lon, *_ in norm:
+        payload += struct.pack("!f", lon)
+    payload += struct.pack("!H", len(norm))
+    for _cs, _tg, _lat, _lon, qth, *_ in norm:
+        payload += pack_string(qth)
+    payload += struct.pack("!H", len(norm))
+    for *_, blob, _sat_id in norm:
+        payload += pack_string(blob)
+    payload += struct.pack("!H", len(norm))
+    for *_, sat_id in norm:
+        payload += pack_string(sat_id)
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# Message parser
+# ---------------------------------------------------------------------------
+
+def parse_msg(data: bytes):
+    """Parse a frame payload into (type, fields_dict)."""
+    msg_type = struct.unpack_from("!H", data, 0)[0]
+    off = 2
+
+    if msg_type == MSG_TRUNK_HELLO:
+        trunk_id, off = unpack_string(data, off)
+        prefix, off = unpack_string(data, off)
+        priority = struct.unpack_from("!I", data, off)[0]; off += 4
+        nonce, off = unpack_vec_u8(data, off)
+        digest, off = unpack_vec_u8(data, off)
+        role = struct.unpack_from("!B", data, off)[0]; off += 1
+        return msg_type, {
+            "id": trunk_id, "local_prefix": prefix, "priority": priority,
+            "nonce": nonce, "digest": digest, "role": role,
+        }
+    elif msg_type == MSG_TRUNK_TALKER_START:
+        tg = struct.unpack_from("!I", data, off)[0]; off += 4
+        callsign, off = unpack_string(data, off)
+        return msg_type, {"tg": tg, "callsign": callsign}
+    elif msg_type == MSG_TRUNK_TALKER_STOP:
+        tg = struct.unpack_from("!I", data, off)[0]; off += 4
+        return msg_type, {"tg": tg}
+    elif msg_type == MSG_TRUNK_AUDIO:
+        tg = struct.unpack_from("!I", data, off)[0]; off += 4
+        audio, off = unpack_vec_u8(data, off)
+        return msg_type, {"tg": tg, "audio": audio}
+    elif msg_type == MSG_TRUNK_FLUSH:
+        tg = struct.unpack_from("!I", data, off)[0]; off += 4
+        return msg_type, {"tg": tg}
+    elif msg_type == MSG_TRUNK_HEARTBEAT:
+        return msg_type, {}
+    elif msg_type == MSG_TRUNK_NODE_LIST:
+        # 7 u16-prefixed vectors: callsigns, tgs, lats, lons, qth_names,
+        # status_blobs, sat_ids. (MsgPacker<std::vector> in AsyncMsg.h
+        # uses uint16_t for element counts.)
+        def read_vec_str(off):
+            n = struct.unpack_from("!H", data, off)[0]; off += 2
+            out = []
+            for _ in range(n):
+                s, off = unpack_string(data, off)
+                out.append(s)
+            return out, off
+
+        def read_vec_u32(off):
+            n = struct.unpack_from("!H", data, off)[0]; off += 2
+            out = list(struct.unpack_from(f"!{n}I", data, off))
+            off += 4 * n
+            return out, off
+
+        def read_vec_f32(off):
+            n = struct.unpack_from("!H", data, off)[0]; off += 2
+            out = list(struct.unpack_from(f"!{n}f", data, off))
+            off += 4 * n
+            return out, off
+
+        callsigns, off = read_vec_str(off)
+        tgs,       off = read_vec_u32(off)
+        # Best-effort decode of trailing vectors. Older builds may emit
+        # fewer than 7 vectors; tolerate truncation.
+        try:
+            _lats,         off = read_vec_f32(off)
+            _lons,         off = read_vec_f32(off)
+            _qth_names,    off = read_vec_str(off)
+            _status_blobs, off = read_vec_str(off)
+            sat_ids,       off = read_vec_str(off)
+        except struct.error:
+            sat_ids = []
+        return msg_type, {"callsigns": callsigns, "tgs": tgs,
+                          "sat_ids": sat_ids}
+    else:
+        return msg_type, {"raw": data[off:]}
+
+
+# ---------------------------------------------------------------------------
+# TrunkPeer — fake trunk peer
+# ---------------------------------------------------------------------------
+
+class TrunkPeer:
+    def __init__(self):
+        self.sock = None
+
+    def connect(self, host: str, port: int, timeout: float = 5.0):
+        self.sock = socket.create_connection((host, port), timeout=timeout)
+        self.sock.settimeout(timeout)
+
+    def handshake(self, trunk_id: str = "TRUNK_TEST", local_prefix: str = TEST_PREFIX,
+                  priority: int = None, secret: str = TEST_SECRET):
+        if priority is None:
+            priority = struct.unpack("!I", os.urandom(4))[0]
+        hello = build_trunk_hello(trunk_id, local_prefix, priority, secret)
+        send_frame(self.sock, hello)
+        # Wait for reflector's hello back
+        data = recv_frame(self.sock)
+        return parse_msg(data)
+
+    def send_talker_start(self, tg: int, callsign: str):
+        send_frame(self.sock, build_talker_start(tg, callsign))
+
+    def send_talker_stop(self, tg: int):
+        send_frame(self.sock, build_talker_stop(tg))
+
+    def send_audio(self, tg: int, audio: bytes):
+        send_frame(self.sock, build_audio(tg, audio))
+
+    def send_flush(self, tg: int):
+        send_frame(self.sock, build_flush(tg))
+
+    def send_heartbeat(self):
+        send_frame(self.sock, build_heartbeat())
+
+    def send_node_list(self, nodes):
+        send_frame(self.sock, build_node_list(nodes))
+
+    def recv_msg(self, timeout: float = 5.0):
+        old = self.sock.gettimeout()
+        self.sock.settimeout(timeout)
+        try:
+            data = recv_frame(self.sock)
+            return parse_msg(data)
+        finally:
+            self.sock.settimeout(old)
+
+    def close(self):
+        if self.sock:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+            self.sock = None
+
+
+# ---------------------------------------------------------------------------
+# SatellitePeer — fake satellite connecting to a parent reflector
+# ---------------------------------------------------------------------------
+
+class SatellitePeer(TrunkPeer):
+    """Satellite peer — same wire format as TrunkPeer but role=SATELLITE."""
+
+    def connect_satellite(self, name=None, port=None):
+        """Connect to the satellite port of a reflector.
+
+        If `port` is provided it overrides the default-topology lookup, so
+        the twin-topology tests can point at a different host port without
+        duplicating this class.
+        """
+        host = HOST
+        if port is None:
+            if name is None:
+                name = sorted(T.REFLECTORS)[0]
+            port = T.mapped_satellite_port(name)
+        self.connect(host, port)
+
+    def handshake(self, sat_id=SAT_ID, secret=SAT_SECRET, priority=None,
+                  **kwargs):
+        """Send MsgTrunkHello with ROLE_SATELLITE and read parent reply.
+
+        Two-way authentication: satellite proves identity, parent replies
+        with its own hello so the satellite can verify and start forwarding.
+        """
+        if priority is None:
+            priority = struct.unpack("!I", os.urandom(4))[0]
+        hello = build_trunk_hello(sat_id, "", priority, secret,
+                                  role=ROLE_SATELLITE)
+        send_frame(self.sock, hello)
+        # Read the parent's hello reply
+        msg_type, _fields = self.recv_msg(timeout=5.0)
+        assert msg_type == MSG_TRUNK_HELLO, \
+            f"Expected hello reply, got type={msg_type}"
+
+    def send_filter(self, filter_str: str):
+        send_frame(self.sock, build_trunk_filter(filter_str))
+
+
+# ---------------------------------------------------------------------------
+# ClientPeer — fake V2 SvxLink client (no SSL)
+# ---------------------------------------------------------------------------
+
+# Client TCP message types
+MSG_PROTO_VER = 5
+MSG_AUTH_CHALLENGE = 10
+MSG_AUTH_RESPONSE = 11
+MSG_AUTH_OK = 12
+MSG_SERVER_INFO = 100
+MSG_TALKER_START = 104
+MSG_TALKER_STOP = 105
+MSG_SELECT_TG = 106
+MSG_TG_MONITOR = 107
+
+# Client UDP message types
+UDP_HEARTBEAT = 1
+UDP_AUDIO = 101
+UDP_FLUSH = 102
+
+
+class ClientPeer:
+    """Minimal V2 SvxLink client — TCP auth + UDP audio receive."""
+
+    def __init__(self):
+        self.tcp = None
+        self.udp = None
+        self.client_id = None
+        self._udp_seq = 0
+        self._drain_thread = None
+        self._drain_stop = threading.Event()
+        self._tcp_msgs = []
+        self._tcp_msgs_lock = threading.Lock()
+
+    def connect(self, host: str, tcp_port: int, timeout: float = 5.0):
+        self.tcp = socket.create_connection((host, tcp_port), timeout=timeout)
+        self.tcp.settimeout(timeout)
+        self._host = host
+        self._tcp_port = tcp_port
+
+    def authenticate(self, callsign: str = CLIENT_CALLSIGN,
+                     password: str = CLIENT_PASSWORD):
+        """V2 auth: ProtoVer → AuthChallenge → AuthResponse → AuthOk + ServerInfo."""
+        # Send MsgProtoVer(2, 0)
+        payload = struct.pack("!H", MSG_PROTO_VER)
+        payload += struct.pack("!HH", 2, 0)
+        send_frame(self.tcp, payload)
+
+        # Receive MsgAuthChallenge
+        data = recv_frame(self.tcp)
+        msg_type = struct.unpack_from("!H", data, 0)[0]
+        assert msg_type == MSG_AUTH_CHALLENGE, f"expected AuthChallenge, got {msg_type}"
+        challenge, _ = unpack_vec_u8(data, 2)
+
+        # Send MsgAuthResponse
+        digest = hmac.new(password.encode(), challenge, hashlib.sha1).digest()
+        payload = struct.pack("!H", MSG_AUTH_RESPONSE)
+        payload += pack_string(callsign)
+        payload += pack_vec_u8(digest)
+        send_frame(self.tcp, payload)
+
+        # Receive MsgAuthOk
+        data = recv_frame(self.tcp)
+        msg_type = struct.unpack_from("!H", data, 0)[0]
+        assert msg_type == MSG_AUTH_OK, f"expected AuthOk, got {msg_type}"
+
+        # Receive MsgServerInfo — extract client_id
+        data = recv_frame(self.tcp)
+        msg_type = struct.unpack_from("!H", data, 0)[0]
+        assert msg_type == MSG_SERVER_INFO, f"expected ServerInfo, got {msg_type}"
+        _reserved = struct.unpack_from("!H", data, 2)[0]
+        self.client_id = struct.unpack_from("!H", data, 4)[0]
+
+        # Drain any additional server messages (MsgNodeList etc.)
+        self.tcp.settimeout(0.5)
+        try:
+            while True:
+                recv_frame(self.tcp)
+        except (socket.timeout, ConnectionError, OSError):
+            pass
+        self.tcp.settimeout(5.0)
+
+        # Start background thread to drain TCP messages (heartbeats,
+        # talker notifications, etc.) so the TCP buffer doesn't fill up.
+        self._drain_stop.clear()
+        self._drain_thread = threading.Thread(
+            target=self._tcp_drain_loop, daemon=True)
+        self._drain_thread.start()
+
+    def setup_udp(self, udp_port: int = None):
+        """Open UDP socket and register with reflector via heartbeat."""
+        if udp_port is None:
+            udp_port = self._tcp_port  # same port for client protocol
+        self.udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.udp.settimeout(5.0)
+        self._udp_target = (self._host, udp_port)
+
+        # Send UDP heartbeat to register
+        self._send_udp_heartbeat()
+
+        # Wait for heartbeat echo
+        data, _ = self.udp.recvfrom(4096)
+        hdr_type = struct.unpack_from("!H", data, 0)[0]
+        assert hdr_type == UDP_HEARTBEAT, f"expected UDP heartbeat, got {hdr_type}"
+
+    def select_tg(self, tg: int):
+        """Send MsgSelectTG to switch to a talk group."""
+        payload = struct.pack("!H", MSG_SELECT_TG)
+        payload += struct.pack("!I", tg)
+        send_frame(self.tcp, payload)
+
+    def monitor_tgs(self, tgs: list):
+        """Send MsgTgMonitor with a set of TGs to passively monitor."""
+        payload = struct.pack("!H", MSG_TG_MONITOR)
+        payload += struct.pack("!H", len(tgs))
+        for tg in sorted(tgs):
+            payload += struct.pack("!I", tg)
+        send_frame(self.tcp, payload)
+
+    def recv_udp(self, timeout: float = 3.0):
+        """Receive one UDP datagram, return (type, payload_bytes)."""
+        self.udp.settimeout(timeout)
+        data, _ = self.udp.recvfrom(65536)
+        # V2 header: [type(2)][client_id(2)][seq(2)]
+        msg_type = struct.unpack_from("!H", data, 0)[0]
+        return msg_type, data[6:]
+
+    def recv_udp_all(self, timeout: float = 2.0):
+        """Drain all pending UDP datagrams, return list of (type, payload)."""
+        msgs = []
+        self.udp.settimeout(timeout)
+        try:
+            while True:
+                msg_type, payload = self.recv_udp(timeout)
+                msgs.append((msg_type, payload))
+        except (socket.timeout, ConnectionError, OSError):
+            pass
+        return msgs
+
+    def send_udp_audio(self, audio: bytes):
+        """Send a UDP audio frame (V2 format: header + audio_data vec)."""
+        body = pack_vec_u8(audio)
+        pkt = struct.pack("!HHH", UDP_AUDIO, self.client_id, self._udp_seq) + body
+        self._udp_seq = (self._udp_seq + 1) & 0xFFFF
+        self.udp.sendto(pkt, self._udp_target)
+
+    def send_udp_flush(self):
+        """Send a UDP flush (end of audio stream)."""
+        pkt = struct.pack("!HHH", UDP_FLUSH, self.client_id, self._udp_seq)
+        self._udp_seq = (self._udp_seq + 1) & 0xFFFF
+        self.udp.sendto(pkt, self._udp_target)
+
+    def _send_udp_heartbeat(self):
+        pkt = struct.pack("!HHH", UDP_HEARTBEAT, self.client_id, self._udp_seq)
+        self._udp_seq = (self._udp_seq + 1) & 0xFFFF
+        self.udp.sendto(pkt, self._udp_target)
+
+    def get_tcp_msgs(self, msg_type=None):
+        """Return captured TCP messages, optionally filtered by type."""
+        with self._tcp_msgs_lock:
+            if msg_type is None:
+                return list(self._tcp_msgs)
+            return [(t, d) for t, d in self._tcp_msgs if t == msg_type]
+
+    def _tcp_drain_loop(self):
+        """Background: read and capture TCP frames to keep connection alive."""
+        while not self._drain_stop.is_set():
+            try:
+                if self.tcp is None:
+                    break
+                self.tcp.settimeout(0.5)
+                data = recv_frame(self.tcp)
+                msg_type = struct.unpack_from("!H", data, 0)[0]
+                with self._tcp_msgs_lock:
+                    self._tcp_msgs.append((msg_type, data))
+            except (socket.timeout, ConnectionError, OSError):
+                pass
+
+    def close(self):
+        self._drain_stop.set()
+        if self._drain_thread:
+            self._drain_thread.join(timeout=2.0)
+            self._drain_thread = None
+        for s in (self.tcp, self.udp):
+            if s:
+                try:
+                    s.close()
+                except OSError:
+                    pass
+        self.tcp = None
+        self.udp = None
+
+
+# ---------------------------------------------------------------------------
+# HTTP status helpers
+# ---------------------------------------------------------------------------
+
+def get_status(host: str, port: int, timeout: float = 3.0) -> dict:
+    url = f"http://{host}:{port}/status"
+    with urlopen(url, timeout=timeout) as resp:
+        return json.loads(resp.read())
+
+
+def wait_until(predicate, timeout: float = 10.0, interval: float = 0.2,
+               msg: str = "condition not met"):
+    """Poll predicate() until it returns True or timeout expires."""
+    deadline = time.monotonic() + timeout
+    last_exc = None
+    while time.monotonic() < deadline:
+        try:
+            if predicate():
+                return
+        except Exception as e:
+            last_exc = e
+        time.sleep(interval)
+    detail = f" (last error: {last_exc})" if last_exc else ""
+    raise AssertionError(f"Timed out: {msg}{detail}")
+
+
+def wait_for_reflector(host: str, port: int, timeout: float = 60.0):
+    """Wait until the reflector's /status endpoint responds."""
+    def check():
+        try:
+            get_status(host, port, timeout=2.0)
+            return True
+        except (URLError, OSError, json.JSONDecodeError):
+            return False
+    wait_until(check, timeout=timeout, interval=1.0,
+               msg=f"reflector at {host}:{port} not ready")
+
+
+def wait_for_trunk_connected(host: str, port: int, trunk_name: str,
+                             timeout: float = 30.0):
+    """Wait until a specific trunk link shows connected in /status."""
+    def check():
+        status = get_status(host, port)
+        trunks = status.get("trunks", {})
+        return trunks.get(trunk_name, {}).get("connected", False)
+    wait_until(check, timeout=timeout,
+               msg=f"trunk {trunk_name} on {host}:{port} not connected")
+
+
+def pty_send(reflector_name: str, command: str, timeout: float = 5.0) -> str:
+    """Write a line to /dev/shm/reflector_ctrl inside a reflector container
+    and return the captured stdout (the reflector echoes responses there
+    over the next ~200ms — we just confirm the write succeeded)."""
+    svc = T.service_name(reflector_name)
+    # bash here-string ensures a trailing newline (line-buffered PTY)
+    proc = subprocess.run(
+        ["docker", "compose", "-f", "docker-compose.test.yml",
+         "exec", "-T", svc,
+         "bash", "-c", f"printf '%s\\n' {repr(command)} > /dev/shm/reflector_ctrl"],
+        cwd=os.path.dirname(os.path.abspath(__file__)),
+        capture_output=True, text=True, timeout=timeout,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"pty_send to {svc} failed: rc={proc.returncode} "
+            f"stderr={proc.stderr.strip()}")
+    return proc.stdout
+
+
+def docker_logs_since(reflector_name: str, since: str = "5s") -> str:
+    """Return the stdout/stderr of a reflector container since N seconds ago."""
+    svc = T.service_name(reflector_name)
+    proc = subprocess.run(
+        ["docker", "compose", "-f", "docker-compose.test.yml",
+         "logs", "--no-color", "--since", since, svc],
+        cwd=os.path.dirname(os.path.abspath(__file__)),
+        capture_output=True, text=True, timeout=10.0,
+    )
+    return proc.stdout + proc.stderr
+
+
+# ---------------------------------------------------------------------------
+# Test cases
+# ---------------------------------------------------------------------------
+
+class TestTrunkIntegration(unittest.TestCase):
+
+    # First reflector in sorted order is the "primary" target for tests
+    PRIMARY = REFLECTOR_NAMES[0]
+
+    @classmethod
+    def setUpClass(cls):
+        """Wait for all reflectors to be healthy and mesh to form."""
+        D = "\033[2m"
+        G = "\033[32m"
+        RST = "\033[0m"
+
+        sys.stderr.write(f"  {D}waiting for reflectors...{RST}")
+        sys.stderr.flush()
+        for name in REFLECTOR_NAMES:
+            wait_for_reflector(*_http(name), timeout=90.0)
+        sys.stderr.write(f"\r\033[K  {G}\u2714{RST} Reflectors up\n")
+
+        sys.stderr.write(f"  {D}waiting for mesh...{RST}")
+        sys.stderr.flush()
+        for name in REFLECTOR_NAMES:
+            for peer in REFLECTOR_NAMES:
+                if peer != name and T.should_trunk(name, peer):
+                    wait_for_trunk_connected(
+                        *_http(name), T.trunk_section_name(name, peer), timeout=30.0)
+        labels = "\u2194".join(n.upper() for n in REFLECTOR_NAMES)
+        sys.stderr.write(f"\r\033[K  {G}\u2714{RST} Mesh connected ({labels})\n")
+        sys.stderr.write(f"\033[2m{'─' * 50}\033[0m\n")
+
+    def _connect_peer(self, target=None, **kwargs):
+        """Helper: create and handshake a TrunkPeer to a reflector."""
+        if target is None:
+            target = self.PRIMARY
+        peer = TrunkPeer()
+        peer.connect(*_trunk(target))
+        msg_type, fields = peer.handshake(**kwargs)
+        self.assertEqual(msg_type, MSG_TRUNK_HELLO)
+        return peer, fields
+
+    def _get_test_talkers(self, name=None):
+        """Get active_talkers dict from the TRUNK_TEST link on a reflector."""
+        if name is None:
+            name = self.PRIMARY
+        status = get_status(*_http(name))
+        return status["trunks"].get("TRUNK_TEST", {}).get("active_talkers", {})
+
+    # ------------------------------------------------------------------
+    # Test 1: Mesh connectivity (no harness needed)
+    # ------------------------------------------------------------------
+    def test_01_mesh_connectivity(self):
+        """All trunk links in the mesh are connected (only the trunks the
+        topology declares — sparse layouts skip non-existent pairs)."""
+        for name in REFLECTOR_NAMES:
+            status = get_status(*_http(name))
+            for peer in REFLECTOR_NAMES:
+                if peer == name or not T.should_trunk(name, peer):
+                    continue
+                section = T.trunk_section_name(name, peer)
+                self.assertTrue(
+                    status["trunks"][section]["connected"],
+                    f"{section} not connected on reflector-{name}")
+
+    # ------------------------------------------------------------------
+    # Test 2: Successful handshake
+    # ------------------------------------------------------------------
+    def test_02_handshake_success(self):
+        """Connect as test peer and receive hello back with correct prefix."""
+        peer, fields = self._connect_peer()
+        try:
+            received = set(p.strip() for p in fields["local_prefix"].split(","))
+            expected = set(T.prefix_list(T.REFLECTORS[self.PRIMARY]["prefix"]))
+            self.assertEqual(received, expected)
+            self.assertGreater(fields["priority"], 0)
+        finally:
+            peer.close()
+
+    # ------------------------------------------------------------------
+    # Test 3: Bad secret rejected
+    # ------------------------------------------------------------------
+    def test_03_handshake_bad_secret(self):
+        """Connection with wrong secret is dropped."""
+        peer = TrunkPeer()
+        peer.connect(*_trunk(self.PRIMARY))
+        hello = build_trunk_hello("BAD_PEER", TEST_PREFIX, 12345, "wrong_secret")
+        send_frame(peer.sock, hello)
+        with self.assertRaises((ConnectionError, OSError, struct.error)):
+            peer.sock.settimeout(5.0)
+            recv_frame(peer.sock)
+        peer.close()
+
+    # ------------------------------------------------------------------
+    # Test 4: Talker start/stop visible in /status
+    # ------------------------------------------------------------------
+    def test_04_talker_start_stop(self):
+        """TalkerStart appears in /status, TalkerStop clears it."""
+        peer, _ = self._connect_peer()
+        try:
+            tg = int(TEST_PREFIX_FIRST + "001")
+            peer.send_talker_start(tg, "TEST1")
+
+            wait_until(lambda: self._get_test_talkers().get(str(tg)) == "TEST1",
+                       timeout=5.0, msg="TalkerStart not visible in /status")
+
+            peer.send_talker_stop(tg)
+
+            wait_until(lambda: str(tg) not in self._get_test_talkers(),
+                       timeout=5.0, msg="TalkerStop not cleared in /status")
+        finally:
+            peer.close()
+
+    # ------------------------------------------------------------------
+    # Test 5: Audio relay (talker lifecycle)
+    # ------------------------------------------------------------------
+    def test_05_audio_relay(self):
+        """Full talker lifecycle: start, audio, flush, stop."""
+        peer, _ = self._connect_peer()
+        try:
+            tg = int(TEST_PREFIX_FIRST + "002")
+            peer.send_talker_start(tg, "AUDIO_TEST")
+
+            wait_until(lambda: self._get_test_talkers().get(str(tg)) == "AUDIO_TEST",
+                       timeout=5.0, msg="talker not visible")
+
+            for _ in range(5):
+                peer.send_audio(tg, b"\x00" * 160)
+
+            peer.send_flush(tg)
+            peer.send_talker_stop(tg)
+
+            wait_until(lambda: str(tg) not in self._get_test_talkers(),
+                       timeout=5.0, msg="talker not cleared after stop")
+        finally:
+            peer.close()
+
+    # ------------------------------------------------------------------
+    # Test 6: All cluster TGs accepted regardless of prefix overlap
+    # ------------------------------------------------------------------
+    def test_06_cluster_tgs_accepted(self):
+        """Every configured cluster TG is accepted via trunk.
+
+        Tests cluster TGs with different prefix relationships:
+        - no prefix match  (not owned by any reflector)
+        - prefix overlap   (starts with a reflector's prefix)
+        - test-peer prefix (starts with the harness prefix)
+
+        Trunk talker events are NOT re-forwarded to other peers (prevents
+        loops). The receiving reflector must accept and record each locally.
+        """
+        peer, _ = self._connect_peer()
+        try:
+            # Start a talker on every configured cluster TG
+            for tg in T.CLUSTER_TGS:
+                peer.send_talker_start(tg, f"CLUSTER_{tg}")
+
+            # Verify all appear on the primary reflector's TRUNK_TEST link
+            def all_visible():
+                talkers = self._get_test_talkers()
+                return all(
+                    talkers.get(str(tg)) == f"CLUSTER_{tg}"
+                    for tg in T.CLUSTER_TGS
+                )
+
+            wait_until(all_visible, timeout=5.0,
+                       msg="not all cluster TGs visible on primary reflector")
+
+            # Verify NOT propagated to other peers (no trunk-to-trunk forwarding)
+            time.sleep(1.0)
+            for name in REFLECTOR_NAMES:
+                if name == self.PRIMARY:
+                    continue
+                primary_section = T.trunk_section_name(name, self.PRIMARY)
+                status = get_status(*_http(name))
+                talkers = status["trunks"].get(primary_section, {}).get("active_talkers", {})
+                for tg in T.CLUSTER_TGS:
+                    self.assertNotIn(str(tg), talkers,
+                        f"cluster TG {tg} should NOT propagate trunk-to-trunk "
+                        f"(found on reflector-{name})")
+
+            # Stop all and verify cleared
+            for tg in T.CLUSTER_TGS:
+                peer.send_talker_stop(tg)
+
+            def all_cleared():
+                talkers = self._get_test_talkers()
+                return all(str(tg) not in talkers for tg in T.CLUSTER_TGS)
+
+            wait_until(all_cleared, timeout=5.0,
+                       msg="not all cluster TGs cleared")
+        finally:
+            peer.close()
+
+    # ------------------------------------------------------------------
+    # Test 7: Heartbeat keepalive
+    # ------------------------------------------------------------------
+    def test_07_heartbeat(self):
+        """Sending heartbeats keeps the connection alive."""
+        peer, _ = self._connect_peer()
+        try:
+            for _ in range(3):
+                peer.send_heartbeat()
+                time.sleep(1)
+
+            tg = int(TEST_PREFIX_FIRST + "003")
+            peer.send_talker_start(tg, "HB_TEST")
+
+            wait_until(lambda: self._get_test_talkers().get(str(tg)) == "HB_TEST",
+                       timeout=5.0, msg="connection died despite heartbeats")
+
+            peer.send_talker_stop(tg)
+        finally:
+            peer.close()
+
+    # ------------------------------------------------------------------
+    # Test 8: Disconnect cleanup
+    # ------------------------------------------------------------------
+    def test_08_disconnect_cleanup(self):
+        """Abrupt disconnect clears the talker from /status."""
+        peer, _ = self._connect_peer()
+        tg = int(TEST_PREFIX_FIRST + "004")
+        peer.send_talker_start(tg, "DISCONNECT_TEST")
+
+        wait_until(lambda: self._get_test_talkers().get(str(tg)) == "DISCONNECT_TEST",
+                   timeout=5.0, msg="talker not visible before disconnect")
+
+        # Abrupt close (no TalkerStop sent)
+        peer.sock.close()
+        peer.sock = None
+
+        wait_until(lambda: str(tg) not in self._get_test_talkers(),
+                   timeout=10.0, msg="talker not cleared after disconnect")
+
+    # ------------------------------------------------------------------
+    # Test 9: Audio not forwarded trunk-to-trunk (routing correctness)
+    # ------------------------------------------------------------------
+    def test_09_no_trunk_to_trunk_audio(self):
+        """Audio from one trunk peer is NOT forwarded to another.
+
+        By design, trunk-received audio only goes to local clients and
+        satellites — never to other trunk peers (loop prevention).
+        A second harness (TRUNK_TEST_RX) verifies it receives no audio
+        or talker frames, while /status confirms the sender's audio was
+        actually processed by the reflector.
+        """
+        # Sender: connect as TRUNK_TEST (prefix 9)
+        sender, _ = self._connect_peer()
+
+        # Receiver: connect as TRUNK_TEST_RX (prefix 8)
+        receiver = TrunkPeer()
+        receiver.connect(*_trunk(self.PRIMARY))
+        rx_type, rx_fields = receiver.handshake(
+            trunk_id="TRUNK_TEST_RX", local_prefix=TEST_RX_PREFIX,
+            secret=TEST_RX_SECRET)
+        self.assertEqual(rx_type, MSG_TRUNK_HELLO)
+
+        try:
+            tg = T.CLUSTER_TGS[0]  # cluster TG accepted from any peer
+            audio_payload = b"\xAA\xBB" * 80  # distinctive pattern
+
+            # Sender: full audio lifecycle
+            sender.send_talker_start(tg, "AUDIO_SRC")
+
+            wait_until(lambda: self._get_test_talkers().get(str(tg)) == "AUDIO_SRC",
+                       timeout=5.0, msg="sender talker not visible")
+
+            for _ in range(5):
+                sender.send_audio(tg, audio_payload)
+            sender.send_flush(tg)
+            sender.send_talker_stop(tg)
+
+            wait_until(lambda: str(tg) not in self._get_test_talkers(),
+                       timeout=5.0, msg="sender talker not cleared")
+
+            # Receiver: drain all pending frames — should only see heartbeats,
+            # never TalkerStart, Audio, or Flush from the sender's session.
+            audio_leaked = False
+            talker_leaked = False
+            receiver.sock.settimeout(2.0)
+            try:
+                while True:
+                    data = recv_frame(receiver.sock)
+                    msg_type, _ = parse_msg(data)
+                    if msg_type == MSG_TRUNK_HEARTBEAT:
+                        continue
+                    if msg_type in (MSG_TRUNK_TALKER_START, MSG_TRUNK_TALKER_STOP):
+                        talker_leaked = True
+                    if msg_type in (MSG_TRUNK_AUDIO, MSG_TRUNK_FLUSH):
+                        audio_leaked = True
+            except (socket.timeout, ConnectionError, OSError):
+                pass  # expected — no more frames
+
+            self.assertFalse(talker_leaked,
+                "trunk peer received TalkerStart/Stop from another trunk peer "
+                "(trunk-to-trunk forwarding should not happen)")
+            self.assertFalse(audio_leaked,
+                "trunk peer received Audio/Flush from another trunk peer "
+                "(trunk-to-trunk forwarding should not happen)")
+
+        finally:
+            sender.close()
+            receiver.close()
+
+    # ------------------------------------------------------------------
+    # Test 10: Audio delivered to V2 client (end-to-end)
+    # ------------------------------------------------------------------
+    def test_10_audio_delivered_to_client(self):
+        """Trunk audio reaches a V2 client connected to the same reflector.
+
+        A trunk harness sends audio on a cluster TG.  A V2 client (no SSL)
+        authenticated on the same reflector, monitoring that TG, must receive
+        the audio as UDP datagrams — proving end-to-end delivery.
+        """
+        # Connect V2 client to reflector-a
+        client = ClientPeer()
+        client.connect(*_trunk(self.PRIMARY))  # same host, but need CLIENT port
+        client.close()  # wrong port — need the client port
+
+        client = ClientPeer()
+        client_port = T.mapped_client_port(self.PRIMARY)
+        client.connect(HOST, client_port)
+        client.authenticate()
+        client.setup_udp(udp_port=client_port)
+
+        tg = T.CLUSTER_TGS[0]
+        client.select_tg(tg)
+        # Small delay for TG selection to take effect
+        time.sleep(0.3)
+
+        # Connect trunk harness and send audio
+        sender, _ = self._connect_peer()
+        try:
+            audio_payload = b"\xDE\xAD" * 80  # distinctive 160-byte pattern
+
+            sender.send_talker_start(tg, "E2E_TEST")
+
+            wait_until(lambda: self._get_test_talkers().get(str(tg)) == "E2E_TEST",
+                       timeout=5.0, msg="talker not visible")
+
+            for _ in range(3):
+                sender.send_audio(tg, audio_payload)
+            sender.send_flush(tg)
+            sender.send_talker_stop(tg)
+
+            # Client should receive UDP audio + flush
+            msgs = client.recv_udp_all(timeout=3.0)
+            audio_count = sum(1 for t, _ in msgs if t == UDP_AUDIO)
+            flush_count = sum(1 for t, _ in msgs if t == UDP_FLUSH)
+
+            self.assertGreater(audio_count, 0,
+                "V2 client received no audio frames from trunk sender")
+            self.assertGreater(flush_count, 0,
+                "V2 client received no flush after trunk audio")
+
+        finally:
+            sender.close()
+            client.close()
+
+    # ------------------------------------------------------------------
+    # Test 11: Cross-reflector audio delivery
+    # ------------------------------------------------------------------
+    def test_11_cross_reflector_audio(self):
+        """Audio from a client on reflector-a reaches a client on reflector-b.
+
+        A V2 client on reflector-a talks on a TG owned by reflector-b.
+        Reflector-a forwards via trunk. A V2 client on reflector-b
+        monitoring that TG must receive the audio as UDP datagrams.
+        """
+        # Pick a TG owned by a DIFFERENT reflector
+        other = [n for n in REFLECTOR_NAMES if n != self.PRIMARY][0]
+        other_prefix = T.first_prefix(T.REFLECTORS[other]["prefix"])
+        tg = int(other_prefix + "001")
+
+        # Receiver: V2 client on the OTHER reflector, monitoring the TG
+        receiver = ClientPeer()
+        rx_port = T.mapped_client_port(other)
+        receiver.connect(HOST, rx_port)
+        receiver.authenticate(callsign=CLIENT_CALLSIGN, password=CLIENT_PASSWORD)
+        receiver.setup_udp(udp_port=rx_port)
+        receiver.select_tg(tg)
+        time.sleep(0.3)
+
+        # Sender: trunk harness on the PRIMARY reflector, acting as a
+        # local talker (prefix matches primary → sent to the other via trunk)
+        # We use the trunk harness because it reliably sustains audio.
+        # The trunk harness sends TalkerStart for a TG matching the other
+        # reflector's prefix — the primary reflector forwards it via TRUNK.
+        #
+        # But wait: the trunk harness has prefix 9, and TG tg starts with
+        # other_prefix. The primary's TRUNK link to 'other' will forward
+        # if isSharedTG matches. Since the harness sends TalkerStart on
+        # the primary reflector, and the primary's onLocalTalkerStart...
+        # Actually, the harness is a TRUNK peer, not a local client.
+        # Trunk TalkerStart from harness → setTrunkTalkerForTG → does NOT
+        # re-forward to other trunks.
+        #
+        # So we must use a V2 client as sender to trigger the local→trunk path.
+        sender = ClientPeer()
+        tx_port = T.mapped_client_port(self.PRIMARY)
+        sender.connect(HOST, tx_port)
+        sender.authenticate(callsign=CLIENT2_CALLSIGN, password=CLIENT2_PASSWORD)
+        sender.setup_udp(udp_port=tx_port)
+        sender.select_tg(tg)
+        time.sleep(0.3)
+
+        try:
+            # Send audio — even 1 frame reaching the reflector triggers
+            # the local talker → trunk forwarding → remote client path
+            for _ in range(5):
+                sender.send_udp_audio(b"\xBE\xEF" * 80)
+                time.sleep(0.02)
+
+            # Give time for trunk propagation
+            time.sleep(1.0)
+
+            # Receiver should have gotten at least some audio or flush
+            msgs = receiver.recv_udp_all(timeout=2.0)
+            audio_count = sum(1 for t, _ in msgs if t == UDP_AUDIO)
+            flush_count = sum(1 for t, _ in msgs if t == UDP_FLUSH)
+
+            self.assertGreater(audio_count + flush_count, 0,
+                f"V2 client on reflector-{other} received no audio/flush "
+                f"for TG {tg} sent from reflector-{self.PRIMARY}")
+
+        finally:
+            sender.close()
+            receiver.close()
+
+    # ------------------------------------------------------------------
+    # Test 12: Satellite handshake and /status
+    # ------------------------------------------------------------------
+    def test_12_satellite_handshake(self):
+        """Satellite connects to parent and appears in /status."""
+        sat = SatellitePeer()
+        sat.connect_satellite()
+        sat.handshake()
+        try:
+            def sat_in_status():
+                status = get_status(*_http(self.PRIMARY))
+                sats = status.get("satellites", {})
+                info = sats.get(SAT_ID, {})
+                return info.get("authenticated", False)
+
+            wait_until(sat_in_status, timeout=5.0,
+                       msg="satellite not visible in /status")
+        finally:
+            sat.close()
+
+    # ------------------------------------------------------------------
+    # Test 13: Satellite audio reaches parent's local clients
+    # ------------------------------------------------------------------
+    def test_13_satellite_audio_to_parent(self):
+        """Audio sent by satellite is received by a V2 client on the parent."""
+        # V2 client on parent reflector
+        client = ClientPeer()
+        client_port = T.mapped_client_port(self.PRIMARY)
+        client.connect(HOST, client_port)
+        client.authenticate()
+        client.setup_udp(udp_port=client_port)
+
+        tg = int(TEST_PREFIX_FIRST + "010")
+        client.select_tg(tg)
+        time.sleep(0.3)
+
+        # Satellite connects and sends audio
+        sat = SatellitePeer()
+        sat.connect_satellite()
+        sat.handshake()
+        try:
+            sat.send_talker_start(tg, "SAT_TX")
+            for _ in range(3):
+                sat.send_audio(tg, b"\xCA\xFE" * 80)
+            sat.send_flush(tg)
+            sat.send_talker_stop(tg)
+
+            msgs = client.recv_udp_all(timeout=3.0)
+            audio_count = sum(1 for t, _ in msgs if t == UDP_AUDIO)
+            self.assertGreater(audio_count, 0,
+                "V2 client on parent received no audio from satellite")
+        finally:
+            sat.close()
+            client.close()
+
+    # ------------------------------------------------------------------
+    # Test 14: Satellite receives audio from parent (trunk → satellite)
+    # ------------------------------------------------------------------
+    def test_14_satellite_receives_from_parent(self):
+        """Trunk talker audio on the parent is forwarded to the satellite.
+
+        Trunk harness sends audio on a cluster TG via TRUNK_TEST.
+        The parent forwards trunk talker events to connected satellites.
+        """
+        sat = SatellitePeer()
+        sat.connect_satellite()
+        sat.handshake()
+
+        sender, _ = self._connect_peer()
+        try:
+            tg = T.CLUSTER_TGS[0]
+            sender.send_talker_start(tg, "TRUNK_TO_SAT")
+
+            wait_until(lambda: self._get_test_talkers().get(str(tg)) == "TRUNK_TO_SAT",
+                       timeout=5.0, msg="trunk talker not visible")
+
+            for _ in range(3):
+                sender.send_audio(tg, b"\xBE\xEF" * 80)
+            sender.send_flush(tg)
+            sender.send_talker_stop(tg)
+
+            # Satellite should have received talker + audio + flush
+            sat.sock.settimeout(3.0)
+            got_audio = False
+            got_talker = False
+            try:
+                while True:
+                    data = recv_frame(sat.sock)
+                    msg_type, _ = parse_msg(data)
+                    if msg_type == MSG_TRUNK_TALKER_START:
+                        got_talker = True
+                    elif msg_type == MSG_TRUNK_AUDIO:
+                        got_audio = True
+                    elif msg_type == MSG_TRUNK_HEARTBEAT:
+                        continue
+            except (socket.timeout, ConnectionError, OSError):
+                pass
+
+            self.assertTrue(got_talker,
+                "satellite did not receive TalkerStart from trunk")
+            self.assertTrue(got_audio,
+                "satellite did not receive audio from trunk")
+        finally:
+            sender.close()
+            sat.close()
+
+    # ------------------------------------------------------------------
+    # Test 15: Satellite audio forwarded to trunk peers
+    # ------------------------------------------------------------------
+    def test_15_satellite_audio_to_trunk_peer(self):
+        """Audio from satellite is forwarded by parent to trunk peers.
+
+        Satellite sends audio for a TG owned by reflector-b. Parent
+        should forward to reflector-b via trunk.
+        """
+        sat = SatellitePeer()
+        sat.connect_satellite()
+        sat.handshake()
+
+        other = [n for n in REFLECTOR_NAMES if n != self.PRIMARY][0]
+        other_prefix = T.first_prefix(T.REFLECTORS[other]["prefix"])
+        tg = int(other_prefix + "010")
+
+        try:
+            sat.send_talker_start(tg, "SAT_ROUTE")
+            for _ in range(3):
+                sat.send_audio(tg, b"\x00" * 160)
+            sat.send_flush(tg)
+            sat.send_talker_stop(tg)
+            time.sleep(0.5)
+
+            # Check logs on the other reflector for trunk talker
+            svc = T.service_name(other)
+            lines = docker_log_lines(svc, since_lines=30)
+            pat = re.compile(rf"Trunk talker start on TG #{tg}(?!\d)")
+            found = any(pat.search(line) for line in lines)
+            self.assertTrue(found,
+                f"reflector-{other} did not receive trunk talker for TG {tg} "
+                f"from satellite via parent")
+        finally:
+            sat.close()
+
+    # ------------------------------------------------------------------
+    # Test 16: Satellite disconnect cleanup
+    # ------------------------------------------------------------------
+    def test_16_satellite_disconnect_cleanup(self):
+        """Abrupt satellite disconnect clears it from /status."""
+        sat = SatellitePeer()
+        sat.connect_satellite()
+        sat.handshake()
+
+        def sat_visible():
+            status = get_status(*_http(self.PRIMARY))
+            return SAT_ID in status.get("satellites", {})
+
+        wait_until(sat_visible, timeout=5.0,
+                   msg="satellite not in /status before disconnect")
+
+        # Abrupt close
+        sat.sock.close()
+        sat.sock = None
+
+        def sat_gone():
+            status = get_status(*_http(self.PRIMARY))
+            return SAT_ID not in status.get("satellites", {})
+
+        wait_until(sat_gone, timeout=20.0,
+                   msg="satellite not cleared from /status after disconnect")
+
+    # ------------------------------------------------------------------
+    # Test 16b: Satellite advertises a TG filter; parent honors it
+    # ------------------------------------------------------------------
+    def test_16b_satellite_tg_filter(self):
+        """Satellite sends MsgTrunkFilter after Hello; parent must drop
+        forwarded events for TGs outside the filter.
+
+        Setup:
+          - CLUSTER_TGS are [222, 999] — both normally reach a satellite
+            via the parent (see test_14).
+          - This satellite subscribes to only "222" via the filter.
+          - A trunk peer originates talker+audio on TG 999 (should NOT
+            reach the satellite) and on TG 222 (should reach it).
+        """
+        sat = SatellitePeer()
+        sat.connect_satellite()
+        sat.handshake()
+
+        # Advertise filter; give the parent a moment to install it
+        assert T.CLUSTER_TGS == [222, 999], \
+            "test assumes CLUSTER_TGS = [222, 999]"
+        tg_allowed = T.CLUSTER_TGS[0]   # 222 — matches
+        tg_blocked = T.CLUSTER_TGS[1]   # 999 — does not match
+        sat.send_filter(str(tg_allowed))
+        time.sleep(0.5)
+
+        sender, _ = self._connect_peer()
+        try:
+            # Originate on the BLOCKED TG first, then on the ALLOWED TG
+            for tg, who in ((tg_blocked, "BLOCKED_SRC"),
+                            (tg_allowed, "ALLOWED_SRC")):
+                sender.send_talker_start(tg, who)
+                for _ in range(3):
+                    sender.send_audio(tg, b"\xAA\x55" * 80)
+                sender.send_flush(tg)
+                sender.send_talker_stop(tg)
+
+            # Drain everything the satellite receives in 3s
+            sat.sock.settimeout(3.0)
+            allowed_talker = False
+            allowed_audio = False
+            blocked_talker = False
+            blocked_audio = False
+            try:
+                while True:
+                    data = recv_frame(sat.sock)
+                    msg_type, fields = parse_msg(data)
+                    if msg_type == MSG_TRUNK_HEARTBEAT:
+                        continue
+                    tg = fields.get("tg")
+                    if msg_type == MSG_TRUNK_TALKER_START:
+                        if tg == tg_allowed: allowed_talker = True
+                        if tg == tg_blocked: blocked_talker = True
+                    elif msg_type == MSG_TRUNK_AUDIO:
+                        if tg == tg_allowed: allowed_audio = True
+                        if tg == tg_blocked: blocked_audio = True
+            except (socket.timeout, ConnectionError, OSError):
+                pass
+
+            self.assertTrue(allowed_talker,
+                f"satellite did not receive TalkerStart for TG {tg_allowed} "
+                f"(should match filter)")
+            self.assertTrue(allowed_audio,
+                f"satellite did not receive audio for TG {tg_allowed} "
+                f"(should match filter)")
+            self.assertFalse(blocked_talker,
+                f"satellite received TalkerStart for TG {tg_blocked} "
+                f"(should have been filtered by parent)")
+            self.assertFalse(blocked_audio,
+                f"satellite received audio for TG {tg_blocked} "
+                f"(should have been filtered by parent)")
+        finally:
+            sender.close()
+            sat.close()
+
+    # ------------------------------------------------------------------
+    # Test 16c: Satellite TG filter surfaces in /status
+    # ------------------------------------------------------------------
+    def test_16c_satellite_filter_in_status(self):
+        """After the satellite sends MsgTrunkFilter, the parent's /status
+        endpoint must expose the active filter string under
+        satellites[<id>].filter. Since /status, MQTT retained status, and
+        the Redis live snapshot all serialize SatelliteLink::statusJson(),
+        exposing the field here covers all three observer surfaces.
+        """
+        sat = SatellitePeer()
+        sat.connect_satellite()
+        sat.handshake()
+
+        def sat_present():
+            status = get_status(*_http(self.PRIMARY))
+            return SAT_ID in status.get("satellites", {})
+        wait_until(sat_present, timeout=5.0,
+                   msg="satellite not visible in /status")
+
+        # No filter set yet → the key should be absent (not empty string)
+        status = get_status(*_http(self.PRIMARY))
+        self.assertNotIn("filter", status["satellites"][SAT_ID],
+            "filter key should be absent when no SATELLITE_FILTER is set")
+
+        # Send a filter; statusChanged(this) on handleMsgTrunkFilter should
+        # make the key appear on the next /status fetch.
+        sat.send_filter("222")
+
+        def filter_visible():
+            status = get_status(*_http(self.PRIMARY))
+            return status.get("satellites", {}).get(SAT_ID, {}).get("filter") == "222"
+        wait_until(filter_visible, timeout=5.0,
+                   msg="filter did not appear in /status.satellites[SAT_ID]")
+
+        # Clearing the filter (empty string) should drop the key.
+        sat.send_filter("")
+        def filter_cleared():
+            status = get_status(*_http(self.PRIMARY))
+            return "filter" not in status.get("satellites", {}).get(SAT_ID, {})
+        wait_until(filter_cleared, timeout=5.0,
+                   msg="filter key not cleared after empty filter sent")
+
+        sat.close()
+
+    # ------------------------------------------------------------------
+    # Test 17: Trunk talker notification reaches monitoring clients
+    # ------------------------------------------------------------------
+    def test_17_bidirectional_trunk_conversation(self):
+        """Full bidirectional conversation through trunk.
+
+        1. Client-A on reflector-a (prefix 122) selects TG 121001 (owned by b)
+        2. Client-B on reflector-b (prefix 121) monitors TG 121001
+        3. Client-A talks → audio reaches client-B via trunk (existing behavior)
+        4. Client-B replies on TG 121001 → audio reaches client-A via trunk
+           (new: peer interest tracking enables the return path)
+        Also verifies that monitoring clients receive MsgTalkerStart for
+        trunk talkers (TgMonitorFilter fix).
+        """
+        other = [n for n in REFLECTOR_NAMES if n != self.PRIMARY][0]
+        other_prefix = T.first_prefix(T.REFLECTORS[other]["prefix"])
+        foreign_tg = int(other_prefix + "001")
+
+        # Home TG for monitoring client on the OTHER reflector
+        home_prefix_other = T.first_prefix(T.REFLECTORS[other]["prefix"])
+        home_tg_other = int(home_prefix_other + "000")
+
+        # --- Client-A on PRIMARY reflector: selected on the foreign TG ---
+        client_a = ClientPeer()
+        a_port = T.mapped_client_port(self.PRIMARY)
+        client_a.connect(HOST, a_port)
+        client_a.authenticate(callsign=CLIENT_CALLSIGN,
+                              password=CLIENT_PASSWORD)
+        client_a.setup_udp(udp_port=a_port)
+        client_a.select_tg(foreign_tg)
+        time.sleep(0.3)
+
+        # --- Client-B on OTHER reflector: home TG, monitoring foreign TG ---
+        client_b = ClientPeer()
+        b_port = T.mapped_client_port(other)
+        client_b.connect(HOST, b_port)
+        client_b.authenticate(callsign=CLIENT2_CALLSIGN,
+                              password=CLIENT2_PASSWORD)
+        client_b.setup_udp(udp_port=b_port)
+        client_b.select_tg(home_tg_other)
+        client_b.monitor_tgs([foreign_tg])
+        time.sleep(0.3)
+
+        try:
+            # === Phase 1: Client-A talks on foreign TG ===
+            # This establishes peer interest on reflector-b's trunk to refl-a
+            for _ in range(5):
+                client_a.send_udp_audio(b"\xCA\xFE" * 80)
+                time.sleep(0.02)
+            client_a.send_udp_flush()
+
+            # Wait for trunk propagation
+            time.sleep(2.0)
+
+            # Client-B (monitoring) should have received MsgTalkerStart
+            talker_starts = client_b.get_tcp_msgs(MSG_TALKER_START)
+            found_start = any(
+                struct.unpack_from("!I", d, 2)[0] == foreign_tg
+                for _, d in talker_starts if len(d) >= 6
+            )
+            self.assertTrue(found_start,
+                f"Monitoring client-B did not receive MsgTalkerStart for "
+                f"TG {foreign_tg} via trunk")
+
+            # === Phase 2: Client-B switches to foreign TG and replies ===
+            client_b.select_tg(foreign_tg)
+            time.sleep(0.3)
+
+            for _ in range(5):
+                client_b.send_udp_audio(b"\xBE\xEF" * 80)
+                time.sleep(0.02)
+            client_b.send_udp_flush()
+
+            # Wait for trunk propagation (return path via interest tracking)
+            time.sleep(2.0)
+
+            # Client-A should receive audio on the return path
+            msgs_a = client_a.recv_udp_all(timeout=2.0)
+            audio_count = sum(1 for t, _ in msgs_a if t == UDP_AUDIO)
+            flush_count = sum(1 for t, _ in msgs_a if t == UDP_FLUSH)
+
+            self.assertGreater(audio_count + flush_count, 0,
+                f"Client-A on {self.PRIMARY} received no audio/flush for "
+                f"TG {foreign_tg} reply from {other} "
+                f"(peer interest tracking failed)")
+
+        finally:
+            client_a.close()
+            client_b.close()
+
+    def test_18_mqtt_talker_event(self):
+        """MQTT publishes talker start/stop events (peer-namespaced for trunk talkers)."""
+        received = []
+        connected_event = threading.Event()
+
+        def on_connect(client, userdata, flags, rc):
+            # Subscribe to both local talker topics and peer-namespaced talker topics
+            client.subscribe("svxreflector/a/talker/#")
+            client.subscribe("svxreflector/a/peer/#")
+            connected_event.set()
+
+        def on_message(client, userdata, msg):
+            received.append((msg.topic, json.loads(msg.payload)))
+
+        mc = mqtt_client.Client()
+        mc.on_connect = on_connect
+        mc.on_message = on_message
+        mc.connect(HOST, 11883, 60)
+        mc.loop_start()
+
+        try:
+            self.assertTrue(connected_event.wait(timeout=5),
+                            "MQTT subscribe timed out")
+            time.sleep(0.5)  # Let subscription settle
+
+            # Connect trunk peer and send talker start.
+            # The peer sends trunk_id="TRUNK_TEST" in MsgPeerHello, so the
+            # reflector uses "TRUNK_TEST" as the peer_id for namespacing.
+            peer = TrunkPeer()
+            peer.connect(*_trunk("a"))
+            peer.handshake()
+
+            peer_id = "TRUNK_TEST"
+            tg = 1220  # Owned by reflector-a (prefix 122)
+            t0_ms = int(time.time() * 1000)
+            peer.send_talker_start(tg, "N0MQTT")
+            time.sleep(2)  # Allow propagation
+
+            # Trunk talker events now go to peer/<peer_id>/talker/<tg>/start
+            expected_start_topic = (
+                f"svxreflector/a/peer/{peer_id}/talker/{tg}/start"
+            )
+            start_events = [r for r in received
+                            if r[0] == expected_start_topic]
+            self.assertTrue(len(start_events) > 0,
+                            f"Expected MQTT talker start at '{expected_start_topic}', "
+                            f"got topics: {[r[0] for r in received]}")
+            start_payload = start_events[0][1]
+            self.assertEqual(start_payload["callsign"], "N0MQTT")
+            # New schema: ts is Unix epoch ms, close to "now".
+            self.assertIn("ts", start_payload,
+                          "talker start payload missing 'ts' field")
+            start_ts = start_payload["ts"]
+            self.assertIsInstance(start_ts, int)
+            self.assertGreaterEqual(start_ts, t0_ms - 5_000)
+            self.assertLessEqual(start_ts, t0_ms + 60_000)
+
+            # Flat talker/<tg>/start should NOT be published for trunk talkers
+            flat_start_events = [r for r in received
+                                 if r[0] == f"svxreflector/a/talker/{tg}/start"]
+            self.assertEqual(len(flat_start_events), 0,
+                             "Flat talker/<tg>/start must not be published for "
+                             "trunk talkers (should use peer-namespaced topic)")
+
+            # Hold the talker briefly so duration_ms is non-zero.
+            time.sleep(0.5)
+            peer.send_talker_stop(tg)
+            time.sleep(2)
+
+            expected_stop_topic = (
+                f"svxreflector/a/peer/{peer_id}/talker/{tg}/stop"
+            )
+            stop_events = [r for r in received
+                           if r[0] == expected_stop_topic]
+            self.assertTrue(len(stop_events) > 0,
+                            f"Expected MQTT talker stop at '{expected_stop_topic}', "
+                            f"got topics: {[r[0] for r in received]}")
+            stop_payload = stop_events[0][1]
+            self.assertIn("ts", stop_payload,
+                          "talker stop payload missing 'ts' field")
+            self.assertGreaterEqual(stop_payload["ts"], start_ts)
+            # duration_ms should be present (matching start was observed)
+            # and roughly match the time between start and stop.
+            self.assertIn("duration_ms", stop_payload,
+                          "talker stop payload missing 'duration_ms' field")
+            self.assertGreaterEqual(stop_payload["duration_ms"], 400)
+            self.assertEqual(
+                stop_payload["duration_ms"], stop_payload["ts"] - start_ts,
+                "duration_ms should equal stop ts minus start ts")
+
+            # Note on edge cases not exercised here:
+            # MqttPublisher omits duration_ms when no matching start was
+            # recorded (reflector restart) or when the wall clock moved
+            # backwards between start and stop (NTP correction yielding a
+            # negative duration). Both paths are guarded in
+            # MqttPublisher::onTalkerStop / onPeerTalkerStop. Reaching
+            # them from this integration suite would require restarting
+            # the reflector mid-talker or manipulating its clock; the
+            # behaviour is documented in docs/MQTT.md instead.
+
+            peer.close()
+        finally:
+            mc.loop_stop()
+            mc.disconnect()
+
+    # ------------------------------------------------------------------
+    # Test 19: PEER_ID is advertised in MsgTrunkHello
+    # ------------------------------------------------------------------
+    def test_19_peer_id_in_hello(self):
+        """When PEER_ID is configured, the reflector advertises it (not the
+        section name) in its outbound hello on the TRUNK_TEST_FILTER link."""
+        # Listen for an outbound connection on port 59304 — the reflector
+        # is configured to dial 192.0.2.1:59304 which is a black hole, so
+        # we can't capture *that*. Instead we verify the PEER_ID via the
+        # inbound side: we connect to the reflector's trunk port and send
+        # a hello as the FILTER peer; the reflector replies with its hello
+        # using PEER_ID="filter-peer".
+        peer = TrunkPeer()
+        peer.connect(*_trunk(self.PRIMARY))
+        msg_type, fields = peer.handshake(
+            trunk_id="TRUNK_TEST_FILTER",
+            local_prefix=FILTER_PREFIX,
+            secret=FILTER_SECRET,
+        )
+        try:
+            self.assertEqual(msg_type, MSG_TRUNK_HELLO)
+            self.assertEqual(fields["id"], T.TEST_PEER_FILTER["peer_id"],
+                f"Expected PEER_ID '{T.TEST_PEER_FILTER['peer_id']}' "
+                f"in reflector's hello, got '{fields['id']}'")
+        finally:
+            peer.close()
+
+    # ------------------------------------------------------------------
+    # Test 20: BLACKLIST_TGS drops talker on receive path
+    # ------------------------------------------------------------------
+    def test_20_blacklist_drops_tg(self):
+        """A TalkerStart on a blacklisted TG must NOT appear as an active
+        talker on the receiving reflector."""
+        peer = TrunkPeer()
+        peer.connect(*_trunk(self.PRIMARY))
+        peer.handshake(trunk_id="TRUNK_TEST_FILTER",
+                       local_prefix=FILTER_PREFIX,
+                       secret=FILTER_SECRET)
+        try:
+            blocked_tg = int(T.TEST_PEER_FILTER["blacklist_tgs"])
+            peer.send_talker_start(blocked_tg, "N0BLACK")
+            time.sleep(1.0)
+
+            status = get_status(*_http(self.PRIMARY))
+            active = status["trunks"].get(
+                "TRUNK_TEST_FILTER", {}).get("active_talkers", {})
+            self.assertNotIn(str(blocked_tg), active,
+                f"Blacklisted TG {blocked_tg} appeared as active talker: "
+                f"{active}")
+        finally:
+            peer.close()
+
+    # ------------------------------------------------------------------
+    # Test 21: ALLOW_TGS rejects TGs not in the whitelist
+    # ------------------------------------------------------------------
+    def test_21_allow_tgs_blocks_others(self):
+        """ALLOW_TGS=7*,1220 — TG 7100 must pass, TG 99 must be dropped."""
+        peer = TrunkPeer()
+        peer.connect(*_trunk(self.PRIMARY))
+        peer.handshake(trunk_id="TRUNK_TEST_FILTER",
+                       local_prefix=FILTER_PREFIX,
+                       secret=FILTER_SECRET)
+        try:
+            allowed_tg = 7100  # matches "7*"
+            peer.send_talker_start(allowed_tg, "N0ALLOW")
+            disallowed_tg = 99   # matches neither "7*" nor "1220"
+            peer.send_talker_start(disallowed_tg, "N0BLOCK")
+            time.sleep(1.0)
+
+            active = get_status(*_http(self.PRIMARY))[
+                "trunks"]["TRUNK_TEST_FILTER"]["active_talkers"]
+            self.assertIn(str(allowed_tg), active,
+                f"Allowed TG {allowed_tg} missing from active talkers: "
+                f"{active}")
+            self.assertNotIn(str(disallowed_tg), active,
+                f"Disallowed TG {disallowed_tg} should not be active: "
+                f"{active}")
+        finally:
+            peer.close()
+
+    # ------------------------------------------------------------------
+    # Test 21b: per-link TG filter trims the node roster in /status
+    # ------------------------------------------------------------------
+    def test_21b_filter_drops_nodes_from_roster(self):
+        """A peer-advertised node whose selected TG is blacklisted (or not in
+        ALLOW_TGS) must NOT appear under /status.trunks[X].nodes — the same
+        per-link filter that gates audio/active_talkers also trims the roster.
+        """
+        peer = TrunkPeer()
+        peer.connect(*_trunk(self.PRIMARY))
+        peer.handshake(trunk_id="TRUNK_TEST_FILTER",
+                       local_prefix=FILTER_PREFIX,
+                       secret=FILTER_SECRET)
+        try:
+            blocked_tg = int(T.TEST_PEER_FILTER["blacklist_tgs"])  # 12345
+            allowed_tg = 7100   # matches ALLOW_TGS "7*"
+            disallowed_tg = 99  # matches neither "7*" nor "1220"
+            peer.send_node_list([
+                ("N0ROK", allowed_tg),
+                ("N0RBL", blocked_tg),
+                ("N0RDIS", disallowed_tg),
+            ])
+
+            def roster_callsigns():
+                status = get_status(*_http(self.PRIMARY))
+                nodes = status["trunks"].get(
+                    "TRUNK_TEST_FILTER", {}).get("nodes", [])
+                return {n.get("callsign") for n in nodes}
+
+            # The allowed-TG node must appear (proves the roster was ingested)
+            wait_until(lambda: "N0ROK" in roster_callsigns(),
+                timeout=5.0, interval=0.25,
+                msg="Allowed-TG node N0ROK missing from trunk roster")
+
+            cs = roster_callsigns()
+            self.assertNotIn("N0RBL", cs,
+                f"Blacklisted-TG ({blocked_tg}) node leaked into roster: {cs}")
+            self.assertNotIn("N0RDIS", cs,
+                f"Disallowed-TG ({disallowed_tg}) node leaked into roster: {cs}")
+        finally:
+            peer.close()
+
+    # ------------------------------------------------------------------
+    # Test 21c: per-link TG filter trims monitoredTGs inside the status blob
+    # ------------------------------------------------------------------
+    def test_21c_filter_trims_monitored_tgs_in_blob(self):
+        """A node kept because its SELECTED TG is permitted must still have
+        non-permitted entries trimmed from its status blob's monitoredTGs
+        array — the same per-link gate that drops whole entries (test_21b)
+        also scrubs the monitored list so filtered TGs never surface under
+        /status.trunks[X].nodes[*].monitoredTGs.
+        """
+        peer = TrunkPeer()
+        peer.connect(*_trunk(self.PRIMARY))
+        peer.handshake(trunk_id="TRUNK_TEST_FILTER",
+                       local_prefix=FILTER_PREFIX,
+                       secret=FILTER_SECRET)
+        try:
+            blocked_tg = int(T.TEST_PEER_FILTER["blacklist_tgs"])  # 12345
+            # monitor list mixes allowed (7*), blacklisted, and disallowed TGs
+            blob = json.dumps({"monitoredTGs": [7100, blocked_tg, 99, 7205]})
+            # selected TG 7100 is permitted, so the node itself is kept
+            peer.send_node_list([("N0RMON", 7100, 0.0, 0.0, "", blob, "")])
+
+            def monitored():
+                status = get_status(*_http(self.PRIMARY))
+                nodes = status["trunks"].get(
+                    "TRUNK_TEST_FILTER", {}).get("nodes", [])
+                for n in nodes:
+                    if n.get("callsign") == "N0RMON":
+                        return n.get("monitoredTGs")
+                return None
+
+            wait_until(lambda: monitored() is not None,
+                timeout=5.0, interval=0.25,
+                msg="Kept node N0RMON missing from trunk roster")
+
+            self.assertEqual(sorted(monitored()), [7100, 7205],
+                f"monitoredTGs leaked filtered TGs: {monitored()}")
+        finally:
+            peer.close()
+
+    # ------------------------------------------------------------------
+    # Test 22: TG_MAP remaps incoming TGs
+    # ------------------------------------------------------------------
+    def test_22_tg_map_remap_in(self):
+        """TG_MAP=7000:1220 — peer sends TalkerStart on wire TG 7000,
+        reflector should track it as local TG 1220."""
+        peer = TrunkPeer()
+        peer.connect(*_trunk(self.PRIMARY))
+        peer.handshake(trunk_id="TRUNK_TEST_FILTER",
+                       local_prefix=FILTER_PREFIX,
+                       secret=FILTER_SECRET)
+        try:
+            wire_tg, local_tg = 7000, 1220
+            peer.send_talker_start(wire_tg, "N0MAP")
+            time.sleep(1.0)
+
+            active = get_status(*_http(self.PRIMARY))[
+                "trunks"]["TRUNK_TEST_FILTER"]["active_talkers"]
+            # After mapping, the reflector tracks the LOCAL TG
+            self.assertIn(str(local_tg), active,
+                f"Mapped local TG {local_tg} not active "
+                f"(after wire TG {wire_tg}): {active}")
+            self.assertNotIn(str(wire_tg), active,
+                f"Wire TG {wire_tg} should have been remapped to "
+                f"{local_tg}: {active}")
+        finally:
+            peer.close()
+
+    # ------------------------------------------------------------------
+    # Test 23: PTY TRUNK STATUS lists trunks
+    # ------------------------------------------------------------------
+    def test_23_pty_trunk_status(self):
+        """`TRUNK STATUS` over PTY enumerates the configured trunks."""
+        # Issue command and read the docker logs for the reflector's PTY
+        # echo (the reflector also writes the response back to the PTY,
+        # which our subprocess can't read — so we check that the command
+        # was accepted via no-error from pty_send).
+        out = pty_send(self.PRIMARY, "TRUNK STATUS")
+        # The actual list goes back to the PTY reader. Best we can do
+        # without a PTY reader is verify the command did not error and
+        # the per-link config was previously logged at startup.
+        logs = docker_logs_since(self.PRIMARY, since="120s")
+        self.assertIn("TRUNK_TEST_FILTER", logs,
+            "TRUNK_TEST_FILTER section was not loaded by reflector "
+            f"(out={out!r}, logs head={logs[:400]!r})")
+
+    # ------------------------------------------------------------------
+    # Test 24: PTY TRUNK MUTE blocks audio from the muted callsign
+    # ------------------------------------------------------------------
+    def test_24_pty_trunk_mute(self):
+        """After TRUNK MUTE on a callsign, audio from that callsign on
+        the muted trunk link is dropped (not delivered to local clients)."""
+        peer = TrunkPeer()
+        peer.connect(*_trunk(self.PRIMARY))
+        peer.handshake(trunk_id="TRUNK_TEST_FILTER",
+                       local_prefix=FILTER_PREFIX,
+                       secret=FILTER_SECRET)
+        try:
+            local_tg = 1220       # via TG_MAP from wire 7000
+            wire_tg  = 7000
+
+            # Mute first, then claim TG and send audio
+            pty_send(self.PRIMARY,
+                     "TRUNK MUTE TRUNK_TEST_FILTER N0MUTE")
+            time.sleep(0.3)
+
+            # Local listener
+            listener = ClientPeer()
+            port = T.mapped_client_port(self.PRIMARY)
+            listener.connect(HOST, port)
+            listener.authenticate(callsign=CLIENT_CALLSIGN,
+                                  password=CLIENT_PASSWORD)
+            listener.setup_udp(udp_port=port)
+            listener.select_tg(local_tg)
+            time.sleep(0.3)
+
+            peer.send_talker_start(wire_tg, "N0MUTE")
+            for _ in range(5):
+                peer.send_audio(wire_tg, b"\xAA" * 80)
+                time.sleep(0.02)
+            time.sleep(1.0)
+
+            msgs = listener.recv_udp_all(timeout=1.0)
+            audio_count = sum(1 for t, _ in msgs if t == UDP_AUDIO)
+            listener.close()
+
+            # Cleanup mute
+            pty_send(self.PRIMARY,
+                     "TRUNK UNMUTE TRUNK_TEST_FILTER N0MUTE")
+
+            self.assertEqual(audio_count, 0,
+                f"Listener received {audio_count} audio frame(s) for "
+                f"muted callsign N0MUTE on TG {local_tg}")
+        finally:
+            peer.close()
+
+    # ------------------------------------------------------------------
+    # Test 25: PTY TRUNK RELOAD re-reads BLACKLIST after live CFG update
+    # ------------------------------------------------------------------
+    def test_25_pty_trunk_reload(self):
+        """CFG-update BLACKLIST_TGS for TRUNK_TEST_FILTER, then TRUNK RELOAD
+        — a TG that was previously allowed must now be blocked."""
+        peer = TrunkPeer()
+        peer.connect(*_trunk(self.PRIMARY))
+        peer.handshake(trunk_id="TRUNK_TEST_FILTER",
+                       local_prefix=FILTER_PREFIX,
+                       secret=FILTER_SECRET)
+        try:
+            tg_to_block = 7200  # currently allowed by ALLOW_TGS=7*
+
+            # Sanity: it currently goes through
+            peer.send_talker_start(tg_to_block, "N0PRE")
+            time.sleep(0.5)
+            active = get_status(*_http(self.PRIMARY))[
+                "trunks"]["TRUNK_TEST_FILTER"]["active_talkers"]
+            self.assertIn(str(tg_to_block), active,
+                f"Pre-reload: TG {tg_to_block} should be active, got {active}")
+            peer.send_talker_stop(tg_to_block)
+            time.sleep(0.3)
+
+            # Update config + reload
+            pty_send(self.PRIMARY,
+                     f"CFG TRUNK_TEST_FILTER BLACKLIST_TGS {tg_to_block}")
+            pty_send(self.PRIMARY, "TRUNK RELOAD TRUNK_TEST_FILTER")
+            time.sleep(0.5)
+
+            # Now it must be blocked
+            peer.send_talker_start(tg_to_block, "N0POST")
+            time.sleep(0.5)
+            active = get_status(*_http(self.PRIMARY))[
+                "trunks"]["TRUNK_TEST_FILTER"]["active_talkers"]
+            self.assertNotIn(str(tg_to_block), active,
+                f"Post-reload: TG {tg_to_block} should be blacklisted, "
+                f"got {active}")
+
+            # Restore original config so other tests aren't affected
+            pty_send(self.PRIMARY,
+                     f"CFG TRUNK_TEST_FILTER BLACKLIST_TGS "
+                     f"{T.TEST_PEER_FILTER['blacklist_tgs']}")
+            pty_send(self.PRIMARY, "TRUNK RELOAD TRUNK_TEST_FILTER")
+        finally:
+            peer.close()
+
+    # ------------------------------------------------------------------
+    # Test 26: MQTT_NAME inserts a path component before the topic suffix
+    # ------------------------------------------------------------------
+    def test_26_mqtt_name_in_topic(self):
+        """Reflector 'c' has MQTT_NAME=mqname-c → topics live under
+        svxreflector/c/mqname-c/... — verify a node-list update arrives
+        on the namespaced 'nodes/local' topic."""
+        received = []
+        connected_event = threading.Event()
+        topic_sub = f"svxreflector/c/{T.MQTT_NAMES['c']}/nodes/local"
+
+        def on_connect(client, userdata, flags, rc):
+            client.subscribe(topic_sub)
+            connected_event.set()
+
+        def on_message(client, userdata, msg):
+            received.append((msg.topic, msg.payload.decode()))
+
+        mc = mqtt_client.Client()
+        mc.on_connect = on_connect
+        mc.on_message = on_message
+        mc.connect(HOST, 11883, 60)
+        mc.loop_start()
+        try:
+            self.assertTrue(connected_event.wait(timeout=5),
+                            "MQTT subscribe timed out")
+            time.sleep(0.5)
+
+            # Trigger a node-list update by connecting a client to 'c'
+            client = ClientPeer()
+            port = T.mapped_client_port("c")
+            client.connect(HOST, port)
+            client.authenticate(callsign=CLIENT_CALLSIGN,
+                                password=CLIENT_PASSWORD)
+            try:
+                # Wait for a retained or fresh message
+                wait_until(lambda: len(received) > 0, timeout=5.0,
+                           msg=f"no message on {topic_sub}")
+                topic, payload = received[-1]
+                self.assertEqual(topic, topic_sub)
+                self.assertIn("nodes", payload)
+            finally:
+                client.close()
+        finally:
+            mc.loop_stop()
+            mc.disconnect()
+
+    # ------------------------------------------------------------------
+    # Test 27: MsgTrunkNodeList is emitted on local client login
+    # ------------------------------------------------------------------
+    def test_27_node_list_emitted_to_trunk_peer(self):
+        """Connect as the TRUNK_TEST_RX harness, then connect a V2 client
+        on the primary reflector — within the debounce window the harness
+        must receive a MsgTrunkNodeList containing that client."""
+        rx = TrunkPeer()
+        rx.connect(*_trunk(self.PRIMARY))
+        rx.handshake(trunk_id="TRUNK_TEST_RX",
+                     local_prefix=TEST_RX_PREFIX,
+                     secret=TEST_RX_SECRET)
+        try:
+            # Drain any messages already queued from existing local state
+            rx.sock.settimeout(0.5)
+            try:
+                while True:
+                    recv_frame(rx.sock)
+            except (socket.timeout, ConnectionError):
+                pass
+            rx.sock.settimeout(5.0)
+
+            # Trigger: new client connects → debounced node-list emission
+            client = ClientPeer()
+            port = T.mapped_client_port(self.PRIMARY)
+            client.connect(HOST, port)
+            client.authenticate(callsign=CLIENT_CALLSIGN,
+                                password=CLIENT_PASSWORD)
+            try:
+                # Wait up to 5s for a NodeList frame containing our callsign
+                deadline = time.monotonic() + 5.0
+                found = False
+                while time.monotonic() < deadline and not found:
+                    try:
+                        msg_type, fields = rx.recv_msg(timeout=1.0)
+                    except socket.timeout:
+                        continue
+                    if msg_type != MSG_TRUNK_NODE_LIST:
+                        continue
+                    if CLIENT_CALLSIGN in fields["callsigns"]:
+                        found = True
+                self.assertTrue(found,
+                    f"No MsgTrunkNodeList containing {CLIENT_CALLSIGN} "
+                    f"was received on the trunk")
+            finally:
+                client.close()
+        finally:
+            rx.close()
+
+    # ------------------------------------------------------------------
+    # Test 27b: Trunk peer's roster visible in /status.trunks[X].nodes
+    # ------------------------------------------------------------------
+    def test_27b_trunk_peer_roster_in_status(self):
+        """A client logged in on the primary reflector appears under
+        /status.trunks.<SECTION>.nodes on a trunk peer — symmetric with the
+        twin-partner roster (trunks should expose the same info we already
+        push to MQTT and Redis).
+        """
+        # Pick any peer that trunks to the primary
+        peer = next(n for n in REFLECTOR_NAMES if n != self.PRIMARY)
+        section = T.trunk_section_name(peer, self.PRIMARY)
+
+        client = ClientPeer()
+        try:
+            port = T.mapped_client_port(self.PRIMARY)
+            client.connect(HOST, port)
+            client.authenticate(callsign=CLIENT_CALLSIGN,
+                                password=CLIENT_PASSWORD)
+
+            def callsign_on_peer():
+                status = get_status(*_http(peer))
+                trunk = status.get("trunks", {}).get(section, {})
+                nodes = trunk.get("nodes", [])
+                return any(n.get("callsign") == CLIENT_CALLSIGN for n in nodes)
+
+            wait_until(callsign_on_peer, timeout=5.0, interval=0.25,
+                msg=f"{CLIENT_CALLSIGN} did not appear in {peer}'s "
+                    f"/status.trunks.{section}.nodes after login on "
+                    f"{self.PRIMARY}")
+
+            # Rich-roster check: the partner-node entry must carry an
+            # isTalker flag derived from the live trunk-talker map
+            # (false here — client is idle). This exercises the wire
+            # extension to MsgTrunkNodeList type 121 and the receive-side
+            # join with TGHandler::trunkTalkerForTG.
+            status = get_status(*_http(peer))
+            trunk = status.get("trunks", {}).get(section, {})
+            entry = next(n for n in trunk.get("nodes", [])
+                         if n.get("callsign") == CLIENT_CALLSIGN)
+            self.assertIn("isTalker", entry,
+                "partner-node entry must expose isTalker for parity "
+                "with local-client /status entries")
+            self.assertFalse(entry["isTalker"],
+                "idle client should report isTalker=false")
+        finally:
+            client.close()
+
+        def callsign_gone_from_peer():
+            status = get_status(*_http(peer))
+            trunk = status.get("trunks", {}).get(section, {})
+            nodes = trunk.get("nodes", [])
+            return not any(n.get("callsign") == CLIENT_CALLSIGN for n in nodes)
+
+        wait_until(callsign_gone_from_peer, timeout=5.0, interval=0.25,
+            msg=f"{CLIENT_CALLSIGN} still in {peer}'s "
+                f"/status.trunks.{section}.nodes after disconnect")
+
+    # ------------------------------------------------------------------
+    # Test 28: MQTT client connect/disconnect events
+    # ------------------------------------------------------------------
+    def test_28_mqtt_client_connect_disconnect(self):
+        """Connecting a V2 client publishes a 'connected' MQTT event with
+        tg and ip fields; disconnecting publishes a 'disconnected' event."""
+        received = []
+        connected_event = threading.Event()
+
+        def on_connect(client, userdata, flags, rc):
+            client.subscribe(f"svxreflector/a/client/{CLIENT_CALLSIGN}/#")
+            connected_event.set()
+
+        def on_message(client, userdata, msg):
+            received.append((msg.topic, json.loads(msg.payload)))
+
+        mc = mqtt_client.Client()
+        mc.on_connect = on_connect
+        mc.on_message = on_message
+        mc.connect(HOST, 11883, 60)
+        mc.loop_start()
+
+        try:
+            self.assertTrue(connected_event.wait(timeout=5),
+                            "MQTT subscribe timed out")
+            time.sleep(0.5)
+
+            # Connect a V2 client to reflector-a
+            client = ClientPeer()
+            port = T.mapped_client_port(self.PRIMARY)
+            client.connect(HOST, port)
+            client.authenticate(callsign=CLIENT_CALLSIGN,
+                                password=CLIENT_PASSWORD)
+            time.sleep(2)
+
+            # Verify MQTT connected event
+            topic_connected = (
+                f"svxreflector/a/client/{CLIENT_CALLSIGN}/connected")
+            conn_events = [r for r in received
+                           if r[0] == topic_connected]
+            self.assertTrue(len(conn_events) > 0,
+                            f"Expected MQTT connected event, "
+                            f"got topics: {[r[0] for r in received]}")
+            payload = conn_events[0][1]
+            self.assertIn("tg", payload)
+            self.assertIn("ip", payload)
+
+            # Disconnect the client
+            received.clear()
+            client.close()
+            time.sleep(2)
+
+            # Verify MQTT disconnected event
+            topic_disconnected = (
+                f"svxreflector/a/client/{CLIENT_CALLSIGN}/disconnected")
+            disc_events = [r for r in received
+                           if r[0] == topic_disconnected]
+            self.assertTrue(len(disc_events) > 0,
+                            f"Expected MQTT disconnected event, "
+                            f"got topics: {[r[0] for r in received]}")
+        finally:
+            mc.loop_stop()
+            mc.disconnect()
+
+    # ------------------------------------------------------------------
+    # Test 29: MQTT full status is published periodically
+    # ------------------------------------------------------------------
+    def test_29_mqtt_full_status(self):
+        """The reflector publishes a retained 'status' message on a periodic
+        timer.  Verify it arrives and contains expected top-level keys."""
+        received = []
+        connected_event = threading.Event()
+
+        def on_connect(client, userdata, flags, rc):
+            client.subscribe("svxreflector/a/status")
+            connected_event.set()
+
+        def on_message(client, userdata, msg):
+            received.append(json.loads(msg.payload))
+
+        mc = mqtt_client.Client()
+        mc.on_connect = on_connect
+        mc.on_message = on_message
+        mc.connect(HOST, 11883, 60)
+        mc.loop_start()
+
+        try:
+            self.assertTrue(connected_event.wait(timeout=5),
+                            "MQTT subscribe timed out")
+            # Status is published on a 1s timer (default) and is retained,
+            # so we should get it quickly — either retained or fresh.
+            wait_until(lambda: len(received) > 0, timeout=5.0,
+                       msg="no MQTT status message received")
+
+            status = received[-1]
+            # The status JSON mirrors the HTTP /status endpoint
+            self.assertIn("nodes", status,
+                          f"status payload missing 'nodes': {list(status.keys())}")
+            self.assertIn("trunks", status,
+                          f"status payload missing 'trunks': {list(status.keys())}")
+        finally:
+            mc.loop_stop()
+            mc.disconnect()
+
+    # ------------------------------------------------------------------
+    # Test 30: MQTT local node list on client connect
+    # ------------------------------------------------------------------
+    def test_30_mqtt_local_nodes(self):
+        """When a V2 client connects, the reflector publishes a retained
+        'nodes/local' MQTT message listing all local clients."""
+        received = []
+        connected_event = threading.Event()
+
+        def on_connect(client, userdata, flags, rc):
+            client.subscribe("svxreflector/a/nodes/local")
+            connected_event.set()
+
+        def on_message(client, userdata, msg):
+            received.append(json.loads(msg.payload))
+
+        mc = mqtt_client.Client()
+        mc.on_connect = on_connect
+        mc.on_message = on_message
+        mc.connect(HOST, 11883, 60)
+        mc.loop_start()
+
+        try:
+            self.assertTrue(connected_event.wait(timeout=5),
+                            "MQTT subscribe timed out")
+            time.sleep(0.5)
+
+            # Connect a V2 client to trigger a node-list publish
+            client = ClientPeer()
+            port = T.mapped_client_port(self.PRIMARY)
+            client.connect(HOST, port)
+            client.authenticate(callsign=CLIENT_CALLSIGN,
+                                password=CLIENT_PASSWORD)
+
+            try:
+                # Wait for a nodes/local message containing our callsign
+                def has_our_node():
+                    for msg in received:
+                        if "nodes" not in msg:
+                            continue
+                        for node in msg["nodes"]:
+                            if node.get("callsign") == CLIENT_CALLSIGN:
+                                return True
+                    return False
+
+                wait_until(has_our_node, timeout=5.0,
+                           msg=f"no nodes/local message containing "
+                               f"{CLIENT_CALLSIGN}")
+
+                # Verify structure of the latest message
+                last = received[-1]
+                self.assertIn("nodes", last)
+                self.assertIn("timestamp", last)
+                self.assertIsInstance(last["nodes"], list)
+                callsigns = [n["callsign"] for n in last["nodes"]]
+                self.assertIn(CLIENT_CALLSIGN, callsigns)
+            finally:
+                client.close()
+        finally:
+            mc.loop_stop()
+            mc.disconnect()
+
+    # ------------------------------------------------------------------
+    # Test 31: MQTT works in satellite mode
+    # ------------------------------------------------------------------
+    def test_31_mqtt_satellite_client_events(self):
+        """A satellite-mode reflector publishes MQTT client connect and
+        disconnect events under its own topic prefix, just like a full
+        reflector. Verifies that the MQTT init runs before the satellite
+        early-return in Reflector::initialize()."""
+        sat_name = T.SATELLITE_NODE["name"]
+        sat_topic = f"svxreflector/{sat_name}/client/{CLIENT_CALLSIGN}"
+        received = []
+        sub_event = threading.Event()
+
+        def on_connect(client, userdata, flags, rc):
+            client.subscribe(f"{sat_topic}/#")
+            sub_event.set()
+
+        def on_message(client, userdata, msg):
+            try:
+                payload = json.loads(msg.payload)
+            except (ValueError, json.JSONDecodeError):
+                payload = msg.payload
+            received.append((msg.topic, payload))
+
+        mc = mqtt_client.Client()
+        mc.on_connect = on_connect
+        mc.on_message = on_message
+        mc.connect(HOST, 11883, 60)
+        mc.loop_start()
+
+        try:
+            self.assertTrue(sub_event.wait(timeout=5),
+                            "MQTT subscribe timed out")
+            time.sleep(0.5)
+
+            client = ClientPeer()
+            client.connect(HOST, T.sat_node_mapped_client_port())
+            client.authenticate(callsign=CLIENT_CALLSIGN,
+                                password=CLIENT_PASSWORD)
+            time.sleep(2)
+
+            connected_topic = f"{sat_topic}/connected"
+            conn_events = [r for r in received if r[0] == connected_topic]
+            self.assertTrue(len(conn_events) > 0,
+                            f"Expected MQTT connected event from satellite, "
+                            f"got topics: {[r[0] for r in received]}")
+            payload = conn_events[0][1]
+            self.assertIn("tg", payload)
+            self.assertIn("ip", payload)
+
+            received.clear()
+            client.close()
+            time.sleep(2)
+
+            disconnected_topic = f"{sat_topic}/disconnected"
+            disc_events = [r for r in received if r[0] == disconnected_topic]
+            self.assertTrue(len(disc_events) > 0,
+                            f"Expected MQTT disconnected event from satellite, "
+                            f"got topics: {[r[0] for r in received]}")
+        finally:
+            mc.loop_stop()
+            mc.disconnect()
+
+    # ------------------------------------------------------------------
+    # Test 32: Three-way conversation across the full mesh
+    # ------------------------------------------------------------------
+    def test_32_three_way_conversation(self):
+        """Everyone hears everyone on a shared TG across all three reflectors.
+
+        One V2 client on each of the three mesh reflectors selects the same
+        TG (owned by reflector 'b'). Each client talks in turn; the other two
+        must receive UDP audio/flush. This exercises the owner-relay path
+        where the owning reflector re-forwards trunk-received audio to a
+        second trunk peer — something tests 11/17 do not cover, since they
+        only use two reflectors.
+        """
+        self.assertGreaterEqual(len(REFLECTOR_NAMES), 3,
+            "test_32 requires at least 3 reflectors in the mesh")
+
+        # TG owned by reflector 'b' (longest prefix match wins "121" over "1")
+        owner = "b"
+        owner_prefix = T.first_prefix(T.REFLECTORS[owner]["prefix"])
+        tg = int(owner_prefix + "001")
+
+        # One distinct client per reflector. Distinct callsigns are required
+        # — when both non-owner reflectors forward TrunkTalkerStart to the
+        # owner with the same callsign, the owner's trunk-talker slot for
+        # the TG cannot tell them apart.
+        names = ["a", "b", "c"]
+        creds = [
+            (CLIENT_CALLSIGN, CLIENT_PASSWORD),
+            (CLIENT2_CALLSIGN, CLIENT2_PASSWORD),
+            (CLIENT3_CALLSIGN, CLIENT3_PASSWORD),
+        ]
+        clients = {}
+        try:
+            for name, (cs, pw) in zip(names, creds):
+                c = ClientPeer()
+                port = T.mapped_client_port(name)
+                c.connect(HOST, port)
+                c.authenticate(callsign=cs, password=pw)
+                c.setup_udp(udp_port=port)
+                c.select_tg(tg)
+                clients[name] = c
+            time.sleep(0.8)
+
+            # Periodic TCP heartbeat to keep idle listener sockets alive
+            # (reflector's HEARTBEAT_RX_CNT_RESET = 15s).
+            hb_frame = struct.pack("!H", 1)  # MsgHeartbeat = type 1
+            def keepalive_all():
+                for c in clients.values():
+                    try:
+                        send_frame(c.tcp, hb_frame)
+                    except OSError:
+                        pass
+
+            # Two-pass round-robin so every reflector first observes peer
+            # interest (m_peer_interested_tgs populated via TrunkTalkerStart /
+            # TrunkAudio) before we measure delivery on the second pass.
+            def one_pass(frames_per_sender):
+                for sender_name in names:
+                    # Drain any residual UDP on the listeners before this turn.
+                    for lname in names:
+                        if lname != sender_name:
+                            clients[lname].recv_udp_all(timeout=0.05)
+                    sender = clients[sender_name]
+                    for _ in range(frames_per_sender):
+                        sender.send_udp_audio(b"\xAB\xCD" * 80)
+                        time.sleep(0.02)
+                    sender.send_udp_flush()
+                    time.sleep(1.2)
+                    keepalive_all()
+
+            # Pass 1: prime peer interest on every reflector pair.
+            one_pass(4)
+            # Drain any late packets before measurement.
+            for c in clients.values():
+                c.recv_udp_all(timeout=0.2)
+            keepalive_all()
+
+            # Pass 2: measurement.
+            missing_pairs = []
+            for sender_name in names:
+                for lname in names:
+                    if lname != sender_name:
+                        clients[lname].recv_udp_all(timeout=0.05)
+
+                sender = clients[sender_name]
+                for _ in range(6):
+                    sender.send_udp_audio(b"\xAB\xCD" * 80)
+                    time.sleep(0.02)
+                sender.send_udp_flush()
+
+                time.sleep(1.2)
+                keepalive_all()
+
+                for lname in names:
+                    if lname == sender_name:
+                        continue
+                    msgs = clients[lname].recv_udp_all(timeout=0.8)
+                    audio_count = sum(1 for t, _ in msgs if t == UDP_AUDIO)
+                    flush_count = sum(1 for t, _ in msgs if t == UDP_FLUSH)
+                    if audio_count + flush_count == 0:
+                        missing_pairs.append((sender_name, lname))
+
+            self.assertEqual(missing_pairs, [],
+                f"On TG {tg} (owner={owner}), these sender→listener pairs "
+                f"delivered no audio/flush: {missing_pairs}")
+        finally:
+            for c in clients.values():
+                c.close()
+
+    # ------------------------------------------------------------------
+    # Test 33: Satellite-attached client visible on parent /status
+    # ------------------------------------------------------------------
+    def test_33_satellite_attached_client_on_parent_status(self):
+        """A V2 client attached to the satellite reflector (sat) shows up
+        in the parent's /status under satellites[<sat_id>].nodes.
+
+        Verifies the sat → parent MsgTrunkNodeList carriage and the
+        per-satellite roster surfacing in Reflector::refreshStatus.
+        """
+        sat_id = T.SATELLITE_NODE["id"]
+        parent = T.sat_node_parent()
+        callsign = "N0THRD"  # third test client to avoid colliding with others
+
+        client = ClientPeer()
+        try:
+            client.connect(HOST, T.sat_node_mapped_client_port())
+            client.authenticate(callsign=callsign,
+                                password=CLIENT_PASSWORD)
+
+            def has_node():
+                status = get_status(*_http(parent))
+                sat = status.get("satellites", {}).get(sat_id, {})
+                for n in sat.get("nodes", []):
+                    if n.get("callsign") == callsign:
+                        return True
+                return False
+
+            wait_until(has_node, timeout=8.0,
+                       msg=f"satellite-attached client {callsign} not "
+                           f"visible under /status.satellites.{sat_id}.nodes "
+                           f"on parent {parent}")
+        finally:
+            client.close()
+
+    # ------------------------------------------------------------------
+    # Test 34: Satellite-attached client visible on a far-trunk peer
+    # ------------------------------------------------------------------
+    def test_34_satellite_attached_client_on_trunk_peer(self):
+        """A V2 client attached to the satellite reflector shows up on a
+        far-trunk peer's /status.trunks[<section>].nodes with the sat_id
+        field set, proving the parent re-merges sat-supplied entries
+        into its outbound MsgTrunkNodeList with attribution.
+        """
+        sat_id = T.SATELLITE_NODE["id"]
+        parent = T.sat_node_parent()
+        callsign = "N0THRD"
+
+        # Pick any reflector that trunks to the parent
+        peer = next(n for n in REFLECTOR_NAMES if n != parent)
+        section = T.trunk_section_name(peer, parent)
+
+        client = ClientPeer()
+        try:
+            client.connect(HOST, T.sat_node_mapped_client_port())
+            client.authenticate(callsign=callsign,
+                                password=CLIENT_PASSWORD)
+
+            def has_attributed_node():
+                status = get_status(*_http(peer))
+                trunk = status.get("trunks", {}).get(section, {})
+                for n in trunk.get("nodes", []):
+                    if n.get("callsign") == callsign and \
+                       n.get("sat_id") == sat_id:
+                        return True
+                return False
+
+            wait_until(has_attributed_node, timeout=10.0,
+                       msg=f"satellite client {callsign} not visible with "
+                           f"sat_id={sat_id} under /status.trunks.{section} "
+                           f".nodes on far-trunk peer {peer}")
+        finally:
+            client.close()
+
+    # ------------------------------------------------------------------
+    # Test 35: Parent-local clients visible on the satellite's /status
+    # ------------------------------------------------------------------
+    def test_35_parent_local_visible_on_satellite_status(self):
+        """A V2 client connected to the parent reflector shows up on the
+        satellite's /status under satellite.parent_nodes — proving the
+        parent → satellite MsgTrunkNodeList path delivers the parent's
+        combined view down to subordinate sats.
+        """
+        parent = T.sat_node_parent()
+        sat_name = T.SATELLITE_NODE["name"]
+        callsign = CLIENT_CALLSIGN  # standard test client
+
+        client = ClientPeer()
+        try:
+            client.connect(HOST, T.mapped_client_port(parent))
+            client.authenticate(callsign=callsign,
+                                password=CLIENT_PASSWORD)
+
+            def has_parent_node():
+                status = get_status(HOST, T.sat_node_mapped_http_port())
+                sat_blob = status.get("satellite", {})
+                for n in sat_blob.get("parent_nodes", []):
+                    if n.get("callsign") == callsign:
+                        # parent-local entries must NOT carry a sat_id;
+                        # absence (or empty) means "on the parent itself"
+                        return n.get("sat_id", "") == ""
+                return False
+
+            wait_until(has_parent_node, timeout=8.0,
+                       msg=f"parent-local client {callsign} not visible "
+                           f"under /status.satellite.parent_nodes on "
+                           f"satellite {sat_name}")
+        finally:
+            client.close()
+
+    # ------------------------------------------------------------------
+    # Test 36: Multi-satellite cross-visibility through the parent
+    # ------------------------------------------------------------------
+    def test_36_multi_sat_cross_visibility(self):
+        """Two fake satellites attached to the same parent each see the
+        other's roster contribution, with sat_id stamping that identifies
+        the originating satellite. Self-echo guard: neither satellite
+        ever sees its own contribution echoed back.
+
+        Exercises:
+          - parent stamps incoming sat-supplied entries with the SatelliteLink's
+            satelliteId() on ingest
+          - sendNodeListToAllPeers merges every satellite's roster into
+            the outbound list to other satellites and trunks
+          - per-recipient skip rule: combined view minus the recipient's
+            own contribution
+        """
+        parent = T.sat_node_parent()
+        sat_a = SatellitePeer()
+        sat_b = SatellitePeer()
+
+        SAT_A_ID  = "SAT_FAKE_A"
+        SAT_B_ID  = "SAT_FAKE_B"
+        A_CS, A_TG = "S1CLIENT", 12200
+        B_CS, B_TG = "S2CLIENT", 12201
+
+        def find_entry(fields, callsign):
+            """Return the sat_id stamp for `callsign` in this NodeList,
+            or None if the callsign isn't present."""
+            for cs, sat_id in zip(fields["callsigns"], fields["sat_ids"]):
+                if cs == callsign:
+                    return sat_id
+            return None
+
+        def wait_for_entry(peer, target_cs, target_sat_id, forbid_cs,
+                           forbid_sat_id, timeout=8.0):
+            """Drain NodeLists until we see (target_cs, target_sat_id).
+            Fails the test if (forbid_cs, forbid_sat_id) is ever seen
+            (self-echo guard violation)."""
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                try:
+                    msg_type, fields = peer.recv_msg(timeout=1.0)
+                except socket.timeout:
+                    continue
+                if msg_type != MSG_TRUNK_NODE_LIST:
+                    continue
+                forbid_stamp = find_entry(fields, forbid_cs)
+                if forbid_stamp == forbid_sat_id:
+                    self.fail(
+                        f"self-echo violation: callsign {forbid_cs} "
+                        f"appeared with sat_id={forbid_sat_id} on the "
+                        f"recipient that owns it")
+                if find_entry(fields, target_cs) == target_sat_id:
+                    return True
+            return False
+
+        try:
+            sat_a.connect_satellite(name=parent)
+            sat_a.handshake(sat_id=SAT_A_ID, secret=SAT_SECRET)
+            sat_b.connect_satellite(name=parent)
+            sat_b.handshake(sat_id=SAT_B_ID, secret=SAT_SECRET)
+
+            # Drain any node lists already queued from the parent's
+            # bootstrap fanout (debounce + initial scheduleNodeListUpdate
+            # on hello completion).
+            for s in (sat_a, sat_b):
+                s.sock.settimeout(0.5)
+                try:
+                    while True:
+                        recv_frame(s.sock)
+                except (socket.timeout, ConnectionError):
+                    pass
+                s.sock.settimeout(5.0)
+
+            # Both satellites publish their local rosters. Each push
+            # triggers the parent to re-broadcast its combined view.
+            sat_a.send_node_list([(A_CS, A_TG)])
+            sat_b.send_node_list([(B_CS, B_TG)])
+
+            self.assertTrue(
+                wait_for_entry(sat_b, A_CS, SAT_A_ID, B_CS, SAT_B_ID),
+                f"sat_b never received {A_CS} stamped with sat_id={SAT_A_ID}")
+            self.assertTrue(
+                wait_for_entry(sat_a, B_CS, SAT_B_ID, A_CS, SAT_A_ID),
+                f"sat_a never received {B_CS} stamped with sat_id={SAT_B_ID}")
+        finally:
+            sat_a.close()
+            sat_b.close()
+
+    # ------------------------------------------------------------------
+    # Test 37: Gateway prefix-routing through a non-owner reflector
+    # ------------------------------------------------------------------
+    def test_37_gateway_prefix_routing(self):
+        """Audio crosses two trunk legs via a non-owner gateway, no
+        CLUSTER_TGS involved — pure longest-prefix-match.
+
+        Topology (from topology.py):
+          a  prefix 122   trunks: b, c           (no direct trunk to d)
+          b  prefix 121   trunks: a, c, d        (gateway)
+          c  prefix 1     trunks: a, b
+          d  prefix 1219  trunks: b only
+
+        TG `121950` is owned by d (longest match `1219`), but a has no
+        [TRUNK_*_D] section. a's longest match is `121` → routes to b.
+        b is a non-owner of `121950` (longer prefix `1219` wins in its
+        m_all_prefixes), so under the old `isLocalTG` gate b would have
+        delivered locally and stopped — d would never hear it. With the
+        gate dropped, b's per-trunk filter (isSharedTG selects TRUNK_B_D
+        as the longest-match owner) routes the audio onward to d.
+
+        This test is the cross-mesh case described in
+        docs/TOPOLOGY_EXAMPLES.md §2 — it must work without the operator
+        listing every regional TG in CLUSTER_TGS.
+        """
+        # Skip gracefully if the topology doesn't have d (e.g. a partial
+        # regeneration in someone's working tree).
+        if "d" not in REFLECTOR_NAMES:
+            self.skipTest("test_37 requires reflector 'd' in topology")
+
+        tg = 121950  # longest-match owner: d (1219); next-longest: b (121)
+
+        a_client = ClientPeer()
+        d_client = ClientPeer()
+        try:
+            for client, name, cs, pw in [
+                (a_client, "a", CLIENT_CALLSIGN,  CLIENT_PASSWORD),
+                (d_client, "d", CLIENT2_CALLSIGN, CLIENT2_PASSWORD),
+            ]:
+                port = T.mapped_client_port(name)
+                client.connect(HOST, port)
+                client.authenticate(callsign=cs, password=pw)
+                client.setup_udp(udp_port=port)
+                client.select_tg(tg)
+            time.sleep(0.8)
+
+            hb_frame = struct.pack("!H", 1)  # MsgHeartbeat
+            def keepalive():
+                for c in (a_client, d_client):
+                    try:
+                        send_frame(c.tcp, hb_frame)
+                    except OSError:
+                        pass
+
+            def send_burst(sender, frames=6):
+                for _ in range(frames):
+                    sender.send_udp_audio(b"\xAB\xCD" * 80)
+                    time.sleep(0.02)
+                sender.send_udp_flush()
+
+            # Pass 1: prime peer-interest on the return leg.
+            # a -> b (longest-match 121) -> d (b's longest-match 1219)
+            # registers a-interested at b's TRUNK_A_B and b-interested at
+            # d's TRUNK_B_D, so the return path d -> b -> a will work.
+            a_client.recv_udp_all(timeout=0.05)
+            d_client.recv_udp_all(timeout=0.05)
+            send_burst(a_client)
+            time.sleep(1.2)
+            keepalive()
+            d_client.recv_udp_all(timeout=0.3)
+
+            # Forward leg measurement: a -> ... -> d
+            a_client.recv_udp_all(timeout=0.05)
+            d_client.recv_udp_all(timeout=0.05)
+            send_burst(a_client)
+            time.sleep(1.2)
+            keepalive()
+            d_msgs = d_client.recv_udp_all(timeout=0.8)
+            d_audio = sum(1 for t, _ in d_msgs if t == UDP_AUDIO)
+            d_flush = sum(1 for t, _ in d_msgs if t == UDP_FLUSH)
+            self.assertGreater(d_audio + d_flush, 0,
+                f"forward leg failed: a->b->d on TG {tg} delivered no "
+                f"audio/flush to d (gateway forwarding broken)")
+
+            # Return leg measurement: d -> ... -> a
+            a_client.recv_udp_all(timeout=0.05)
+            d_client.recv_udp_all(timeout=0.05)
+            send_burst(d_client)
+            time.sleep(1.2)
+            keepalive()
+            a_msgs = a_client.recv_udp_all(timeout=0.8)
+            a_audio = sum(1 for t, _ in a_msgs if t == UDP_AUDIO)
+            a_flush = sum(1 for t, _ in a_msgs if t == UDP_FLUSH)
+            self.assertGreater(a_audio + a_flush, 0,
+                f"return leg failed: d->b->a on TG {tg} delivered no "
+                f"audio/flush to a (interest-based return path broken)")
+        finally:
+            a_client.close()
+            d_client.close()
+
+    # ------------------------------------------------------------------
+    # Test 38: Cluster TG broadcast from a local V2 client
+    # ------------------------------------------------------------------
+    def test_38_cluster_tg_local_client_broadcast(self):
+        """Local V2 client keys a cluster TG; another reflector's V2 client
+        on the same TG hears it.
+
+        Cluster TGs are broadcast by `onLocalAudio` regardless of prefix
+        ownership (the outbound path passes `isClusterTG`). This test
+        guards that property — the inbound trunk-to-trunk gate
+        (`shouldRelayInbound`) deliberately *blocks* cluster relay to
+        prevent loops, so the only way for a cluster TG to reach another
+        reflector is the local-client-originated broadcast.
+        """
+        if not T.CLUSTER_TGS:
+            self.skipTest("test_38 requires at least one CLUSTER_TG")
+
+        tg = T.CLUSTER_TGS[0]
+        other = next(n for n in REFLECTOR_NAMES if n != self.PRIMARY)
+
+        sender = ClientPeer()
+        receiver = ClientPeer()
+        try:
+            tx_port = T.mapped_client_port(self.PRIMARY)
+            sender.connect(HOST, tx_port)
+            sender.authenticate(callsign=CLIENT_CALLSIGN, password=CLIENT_PASSWORD)
+            sender.setup_udp(udp_port=tx_port)
+            sender.select_tg(tg)
+
+            rx_port = T.mapped_client_port(other)
+            receiver.connect(HOST, rx_port)
+            receiver.authenticate(callsign=CLIENT2_CALLSIGN, password=CLIENT2_PASSWORD)
+            receiver.setup_udp(udp_port=rx_port)
+            receiver.select_tg(tg)
+            time.sleep(0.4)
+
+            receiver.recv_udp_all(timeout=0.05)
+            for _ in range(6):
+                sender.send_udp_audio(b"\xBE\xEF" * 80)
+                time.sleep(0.02)
+            time.sleep(1.0)
+
+            msgs = receiver.recv_udp_all(timeout=1.5)
+            audio_count = sum(1 for t, _ in msgs if t == UDP_AUDIO)
+            flush_count = sum(1 for t, _ in msgs if t == UDP_FLUSH)
+            self.assertGreater(audio_count + flush_count, 0,
+                f"cluster TG {tg} broadcast from reflector-{self.PRIMARY} "
+                f"did not reach V2 client on reflector-{other}")
+        finally:
+            sender.close()
+            receiver.close()
+
+    # ------------------------------------------------------------------
+    # Test 39: passive monitor actually hears audio across a multi-hop gateway
+    # ------------------------------------------------------------------
+    def test_39_passive_monitor_multihop(self):
+        """A passive monitor on reflector-a hears audio from a TG owned by
+        reflector-d, with reflector-b acting as a gateway, *without* the
+        monitor ever PTT'ing to bootstrap interest.
+
+        Topology (test_37 setup):
+          a  prefix 122   trunks: b, c           (no direct trunk to d)
+          b  prefix 121   trunks: a, c, d        (gateway)
+          d  prefix 1219  trunks: b only
+
+        TG `121951` is owned by d. a's monitored set is advertised via
+        MsgPeerTgInterest to b; b longest-prefix-matches `1219` → d and
+        re-advertises the interest to d. d's PTT then fans out to b
+        (peer-interest), b forwards to a (peer-interest), and a delivers
+        UDP audio to the local monitoring client via TgMonitorFilter. The
+        whole chain works without a transmitting once.
+        """
+        if "d" not in REFLECTOR_NAMES:
+            self.skipTest("test_39 requires reflector 'd' in topology")
+
+        tg = 121951  # owned by d (longest 1219); next-longest at b is 121
+
+        a_client = ClientPeer()
+        d_client = ClientPeer()
+        try:
+            # a-client: connects to a, selects tg=0 (no PTT possible),
+            # monitors `tg` passively. This is the "Swedish ham listening
+            # to an Italian regional TG" case — interest must propagate to
+            # the owner without the monitor transmitting.
+            a_port = T.mapped_client_port("a")
+            a_client.connect(HOST, a_port)
+            a_client.authenticate(callsign=CLIENT_CALLSIGN, password=CLIENT_PASSWORD)
+            a_client.setup_udp(udp_port=a_port)
+            a_client.select_tg(0)
+            a_client.monitor_tgs([tg])
+
+            # d-client: connects to d, selects `tg`, will PTT.
+            d_port = T.mapped_client_port("d")
+            d_client.connect(HOST, d_port)
+            d_client.authenticate(callsign=CLIENT2_CALLSIGN, password=CLIENT2_PASSWORD)
+            d_client.setup_udp(udp_port=d_port)
+            d_client.select_tg(tg)
+
+            # Advertisement is debounced 500 ms in TrunkLink, then re-advertised
+            # at b on receipt → debounced again toward d. 2 s gives both legs
+            # plus a safety margin.
+            time.sleep(2.0)
+
+            # Drain any backlog before the measurement burst.
+            a_client.recv_udp_all(timeout=0.05)
+
+            for _ in range(6):
+                d_client.send_udp_audio(b"\xBE\xEF" * 80)
+                time.sleep(0.02)
+            d_client.send_udp_flush()
+            time.sleep(1.5)
+
+            msgs = a_client.recv_udp_all(timeout=1.0)
+            audio = sum(1 for t, _ in msgs if t == UDP_AUDIO)
+            flush = sum(1 for t, _ in msgs if t == UDP_FLUSH)
+            self.assertGreater(audio + flush, 0,
+                f"passive monitor on reflector-a did not hear TG {tg} "
+                f"audio from reflector-d via gateway b — "
+                f"MsgPeerTgInterest multi-hop propagation or "
+                f"TgMonitorFilter UDP delivery broken")
+        finally:
+            a_client.close()
+            d_client.close()
+
+    # ------------------------------------------------------------------
+    # Test 40: monitor TG UDP audio must not mix with selected-TG audio
+    # ------------------------------------------------------------------
+    def test_40_monitor_does_not_mix_with_selected_tg(self):
+        """Regression for the v1.3.10 audio mixing bug (Fabio IZ2BKS report
+        2026-05-10). With SELECT_TG=9 and MONITOR_TGS=[110], a client must
+        receive ONLY TG 9 UDP audio while TG 9 has an active talker, even if
+        TG 110 also has a simultaneous talker. The pre-v1.3.10 invariant.
+
+        Setup (all on PRIMARY reflector):
+          A: select_tg=9, monitor_tgs=[110]   (the listener — Fabio's role)
+          B: select_tg=9, sends audio P_B     (the QSO partner)
+          C: select_tg=110, sends audio P_C   (the cross-TG talker)
+
+        Assertion: every UDP audio payload received by A contains P_B and
+        does NOT contain P_C.
+        """
+        port = T.mapped_client_port(self.PRIMARY)
+
+        a_client = ClientPeer()
+        b_client = ClientPeer()
+        c_client = ClientPeer()
+        try:
+            a_client.connect(HOST, port)
+            a_client.authenticate(callsign=CLIENT_CALLSIGN, password=CLIENT_PASSWORD)
+            a_client.setup_udp(udp_port=port)
+            a_client.select_tg(9)
+            a_client.monitor_tgs([110])
+
+            b_client.connect(HOST, port)
+            b_client.authenticate(callsign=CLIENT2_CALLSIGN, password=CLIENT2_PASSWORD)
+            b_client.setup_udp(udp_port=port)
+            b_client.select_tg(9)
+
+            c_client.connect(HOST, port)
+            c_client.authenticate(callsign=CLIENT3_CALLSIGN, password=CLIENT3_PASSWORD)
+            c_client.setup_udp(udp_port=port)
+            c_client.select_tg(110)
+
+            time.sleep(0.5)
+            a_client.recv_udp_all(timeout=0.05)  # drain bootstrap traffic
+
+            P_B = b"\xAA\xBB\xAA\xBB"
+            P_C = b"\xCC\xDD\xCC\xDD"
+
+            # Send interleaved audio bursts on TG 9 (B) and TG 110 (C) so
+            # their windows overlap on the reflector.
+            for _ in range(8):
+                b_client.send_udp_audio(P_B * 40)
+                c_client.send_udp_audio(P_C * 40)
+                time.sleep(0.02)
+            b_client.send_udp_flush()
+            c_client.send_udp_flush()
+            time.sleep(0.5)
+
+            msgs = a_client.recv_udp_all(timeout=1.0)
+            audio_payloads = [p for t, p in msgs if t == UDP_AUDIO]
+
+            self.assertGreater(len(audio_payloads), 0,
+                "A received no UDP audio at all — selected-TG fanout broken")
+
+            mixed = [p for p in audio_payloads if P_C in p]
+            self.assertEqual(len(mixed), 0,
+                f"A received {len(mixed)} UDP audio frame(s) carrying TG 110 "
+                f"pattern P_C while SELECT_TG=9 had an active talker — the "
+                f"v1.3.10 monitor-TG mixing bug. Total audio frames: "
+                f"{len(audio_payloads)}.")
+
+            self.assertTrue(any(P_B in p for p in audio_payloads),
+                "A received audio but none of it carried the TG 9 pattern P_B "
+                "— selected-TG delivery itself is broken")
+        finally:
+            a_client.close()
+            b_client.close()
+            c_client.close()
+
+    # ------------------------------------------------------------------
+    # Test 41: priority-driven TG switch via MsgSelectTG resumes audio
+    # ------------------------------------------------------------------
+    def test_41_priority_switch_still_works(self):
+        """When real svxlink sees a higher-priority monitor TG fire while
+        its selected TG is idle, it sends MsgSelectTG to switch. The
+        reflector then routes audio for the new selected TG via TgFilter
+        (the gate is irrelevant on that arm). This test simulates the
+        switch (the Python client can't run svxlink's priority logic) and
+        confirms audio flows after MsgSelectTG.
+
+        Before the simulated switch: A's currentTG=9 idle, monitor=[110],
+        a talker on TG 110. With the new gate AND `currentTG=9 idle`, the
+        monitor arm passes (talkerForTG(9) is null). To make the test
+        independent of that detail and prove the post-switch path, we
+        call select_tg(110), drain any traffic from before the measurement
+        burst, then verify the post-switch audio arrives via TgFilter.
+        """
+        port = T.mapped_client_port(self.PRIMARY)
+
+        a_client = ClientPeer()
+        c_client = ClientPeer()
+        try:
+            a_client.connect(HOST, port)
+            a_client.authenticate(callsign=CLIENT_CALLSIGN, password=CLIENT_PASSWORD)
+            a_client.setup_udp(udp_port=port)
+            a_client.select_tg(9)
+            a_client.monitor_tgs([110])
+
+            c_client.connect(HOST, port)
+            c_client.authenticate(callsign=CLIENT2_CALLSIGN, password=CLIENT2_PASSWORD)
+            c_client.setup_udp(udp_port=port)
+            c_client.select_tg(110)
+
+            time.sleep(0.4)
+
+            # Simulate svxlink's priority-driven switch: A re-selects TG 110.
+            a_client.select_tg(110)
+            time.sleep(0.2)
+            a_client.recv_udp_all(timeout=0.05)
+
+            P_C = b"\xCC\xDD\xCC\xDD"
+            for _ in range(6):
+                c_client.send_udp_audio(P_C * 40)
+                time.sleep(0.02)
+            c_client.send_udp_flush()
+            time.sleep(0.5)
+
+            msgs = a_client.recv_udp_all(timeout=1.0)
+            audio_payloads = [p for t, p in msgs if t == UDP_AUDIO]
+            self.assertGreater(len(audio_payloads), 0,
+                "After simulated priority switch (select_tg(110)), A "
+                "received no TG 110 UDP audio — TgFilter delivery broken")
+            self.assertTrue(any(P_C in p for p in audio_payloads),
+                "Audio arrived but did not carry the TG 110 pattern P_C")
+        finally:
+            a_client.close()
+            c_client.close()
+
+    # ------------------------------------------------------------------
+    # Test 42: passive observer (currentTG=0) still gets monitor UDP
+    # ------------------------------------------------------------------
+    def test_42_passive_observer_unaffected(self):
+        """A client with select_tg(0) and a single monitor TG must still
+        receive UDP audio for that monitor TG. Guards the
+        `tg == 0 → return true` short-circuit in SelectedTgIdleFilter.
+        """
+        port = T.mapped_client_port(self.PRIMARY)
+
+        a_client = ClientPeer()
+        c_client = ClientPeer()
+        try:
+            a_client.connect(HOST, port)
+            a_client.authenticate(callsign=CLIENT_CALLSIGN, password=CLIENT_PASSWORD)
+            a_client.setup_udp(udp_port=port)
+            a_client.select_tg(0)
+            a_client.monitor_tgs([110])
+
+            c_client.connect(HOST, port)
+            c_client.authenticate(callsign=CLIENT2_CALLSIGN, password=CLIENT2_PASSWORD)
+            c_client.setup_udp(udp_port=port)
+            c_client.select_tg(110)
+
+            time.sleep(0.4)
+            a_client.recv_udp_all(timeout=0.05)
+
+            P_C = b"\xCC\xDD\xCC\xDD"
+            for _ in range(6):
+                c_client.send_udp_audio(P_C * 40)
+                time.sleep(0.02)
+            c_client.send_udp_flush()
+            time.sleep(0.5)
+
+            msgs = a_client.recv_udp_all(timeout=1.0)
+            audio_payloads = [p for t, p in msgs if t == UDP_AUDIO]
+            self.assertGreater(len(audio_payloads), 0,
+                "Passive observer (currentTG=0, monitor=[110]) received no "
+                "UDP audio — SelectedTgIdleFilter incorrectly blocking the "
+                "currentTG==0 case")
+            self.assertTrue(any(P_C in p for p in audio_payloads),
+                "Passive observer received audio but no frames carried "
+                "the TG 110 pattern P_C")
+        finally:
+            a_client.close()
+            c_client.close()
+
+    # ------------------------------------------------------------------
+    # Test 43: multi-monitor variant of test_45 — both monitor TGs blocked
+    # ------------------------------------------------------------------
+    def test_43_multi_monitor_udp_blocked_when_selected_tg_set(self):
+        """Multi-monitor variant of test_45. With currentTG=9 and two
+        monitor TGs both busy, A must receive zero UDP audio for either.
+        The reflector blocks the monitor arm uniformly regardless of how
+        many monitor TGs are active — `PassiveObserverFilter` only opens
+        the arm when `currentTG == 0`.
+        """
+        port = T.mapped_client_port(self.PRIMARY)
+
+        a_client = ClientPeer()
+        c_client = ClientPeer()
+        d_client = ClientPeer()
+        try:
+            a_client.connect(HOST, port)
+            a_client.authenticate(callsign=CLIENT_CALLSIGN, password=CLIENT_PASSWORD)
+            a_client.setup_udp(udp_port=port)
+            a_client.select_tg(9)
+            a_client.monitor_tgs([110, 112])
+
+            c_client.connect(HOST, port)
+            c_client.authenticate(callsign=CLIENT2_CALLSIGN, password=CLIENT2_PASSWORD)
+            c_client.setup_udp(udp_port=port)
+            c_client.select_tg(110)
+
+            d_client.connect(HOST, port)
+            d_client.authenticate(callsign=CLIENT3_CALLSIGN, password=CLIENT3_PASSWORD)
+            d_client.setup_udp(udp_port=port)
+            d_client.select_tg(112)
+
+            time.sleep(0.5)
+            a_client.recv_udp_all(timeout=0.05)
+
+            P_C = b"\xCC\xDD\xCC\xDD"
+            P_D = b"\xEE\xFF\xEE\xFF"
+
+            c_client.send_udp_audio(P_C * 40)
+            time.sleep(0.15)
+            for _ in range(8):
+                c_client.send_udp_audio(P_C * 40)
+                d_client.send_udp_audio(P_D * 40)
+                time.sleep(0.02)
+            c_client.send_udp_flush()
+            d_client.send_udp_flush()
+            time.sleep(0.5)
+
+            msgs = a_client.recv_udp_all(timeout=1.0)
+            audio_payloads = [p for t, p in msgs if t == UDP_AUDIO]
+            leaked_c = [p for p in audio_payloads if P_C in p]
+            leaked_d = [p for p in audio_payloads if P_D in p]
+
+            self.assertEqual(len(leaked_c) + len(leaked_d), 0,
+                f"A has currentTG=9 (non-zero) and monitor_tgs=[110, 112]. "
+                f"A received {len(leaked_c)} frame(s) carrying TG 110 "
+                f"pattern P_C and {len(leaked_d)} frame(s) carrying TG 112 "
+                f"pattern P_D. Monitor-TG UDP audio must not reach a client "
+                f"whose selected TG is non-zero, regardless of how many "
+                f"monitor TGs are active. Total audio frames: "
+                f"{len(audio_payloads)}.")
+        finally:
+            a_client.close()
+            c_client.close()
+            d_client.close()
+
+    # ------------------------------------------------------------------
+    # Test 44: passive observer with two simultaneous monitor talkers
+    # ------------------------------------------------------------------
+    def test_44_passive_observer_no_monitor_mix(self):
+        """Same first-talker-wins invariant for a passive observer
+        (currentTG=0). The earlier code path short-circuited `tg==0` in
+        SelectedTgIdleFilter, leaving passive observers fully exposed to
+        multi-monitor mixing. EarliestMonitorTalkerFilter must apply
+        uniformly.
+        """
+        port = T.mapped_client_port(self.PRIMARY)
+
+        a_client = ClientPeer()
+        c_client = ClientPeer()
+        d_client = ClientPeer()
+        try:
+            a_client.connect(HOST, port)
+            a_client.authenticate(callsign=CLIENT_CALLSIGN, password=CLIENT_PASSWORD)
+            a_client.setup_udp(udp_port=port)
+            a_client.select_tg(0)
+            a_client.monitor_tgs([110, 112])
+
+            c_client.connect(HOST, port)
+            c_client.authenticate(callsign=CLIENT2_CALLSIGN, password=CLIENT2_PASSWORD)
+            c_client.setup_udp(udp_port=port)
+            c_client.select_tg(110)
+
+            d_client.connect(HOST, port)
+            d_client.authenticate(callsign=CLIENT3_CALLSIGN, password=CLIENT3_PASSWORD)
+            d_client.setup_udp(udp_port=port)
+            d_client.select_tg(112)
+
+            time.sleep(0.5)
+            a_client.recv_udp_all(timeout=0.05)
+
+            P_C = b"\xCC\xDD\xCC\xDD"
+            P_D = b"\xEE\xFF\xEE\xFF"
+
+            c_client.send_udp_audio(P_C * 40)
+            time.sleep(0.15)
+            for _ in range(8):
+                c_client.send_udp_audio(P_C * 40)
+                d_client.send_udp_audio(P_D * 40)
+                time.sleep(0.02)
+            c_client.send_udp_flush()
+            d_client.send_udp_flush()
+            time.sleep(0.5)
+
+            msgs = a_client.recv_udp_all(timeout=1.0)
+            audio_payloads = [p for t, p in msgs if t == UDP_AUDIO]
+
+            self.assertGreater(len(audio_payloads), 0,
+                "Passive observer received no UDP audio — monitor "
+                "delivery broken for currentTG=0")
+
+            mixed = [p for p in audio_payloads if P_D in p]
+            self.assertEqual(len(mixed), 0,
+                f"Passive observer received {len(mixed)} UDP audio frame(s) "
+                f"carrying TG 112 pattern P_D while TG 110 (started first) "
+                f"was still active — multi-monitor-TG mixing regression for "
+                f"passive observers. Total audio frames: {len(audio_payloads)}.")
+
+            self.assertTrue(any(P_C in p for p in audio_payloads),
+                "Passive observer received audio but none carried the TG 110 "
+                "pattern P_C")
+        finally:
+            a_client.close()
+            c_client.close()
+            d_client.close()
+
+    # ------------------------------------------------------------------
+    # Test 45: monitor-TG UDP audio must NOT reach a client with currentTG != 0
+    # ------------------------------------------------------------------
+    def test_45_monitor_udp_blocked_when_selected_tg_set(self):
+        """Contract test for the reflector's UDP fanout. With a non-zero
+        selected TG, a client must NOT receive UDP audio for any TG in
+        its monitor list — even when the selected TG happens to have no
+        active talker. svxlink's priority/auto-switch logic for monitor
+        TGs is driven by the TCP TalkerStart message; the audio itself
+        only needs to flow once svxlink chooses to switch (via
+        MsgSelectTG), at which point it arrives via the selected-TG arm
+        of the fanout (TgFilter), not the monitor arm.
+
+        Pre-92d9a63 this was the de-facto behavior because the monitor
+        arm did not exist. 92d9a63 added the monitor arm to support
+        passive observers (currentTG=0); the subsequent gates (28ebf29,
+        2c26c8a) narrowed but did not restrict the arm to currentTG=0,
+        which is what this test pins down.
+
+        Setup (all on PRIMARY reflector):
+          A: select_tg=9, monitor_tgs=[110]   (the listener)
+          C: select_tg=110                      (continuous talker)
+
+        Assertion: while A's currentTG=9, A receives zero UDP audio
+        frames carrying the TG 110 pattern P_C, regardless of whether
+        any talker is currently active on TG 9.
+        """
+        port = T.mapped_client_port(self.PRIMARY)
+
+        a_client = ClientPeer()
+        c_client = ClientPeer()
+        try:
+            a_client.connect(HOST, port)
+            a_client.authenticate(callsign=CLIENT_CALLSIGN, password=CLIENT_PASSWORD)
+            a_client.setup_udp(udp_port=port)
+            a_client.select_tg(9)
+            a_client.monitor_tgs([110])
+
+            c_client.connect(HOST, port)
+            c_client.authenticate(callsign=CLIENT2_CALLSIGN, password=CLIENT2_PASSWORD)
+            c_client.setup_udp(udp_port=port)
+            c_client.select_tg(110)
+
+            time.sleep(0.5)
+            a_client.recv_udp_all(timeout=0.05)  # drain bootstrap
+
+            P_C = b"\xCC\xDD\xCC\xDD"
+
+            # C streams TG 110 continuously. A is on TG 9 (idle, no QSO
+            # partner) so SelectedTgIdleFilter passes the monitor arm.
+            burst_start = time.time()
+            while time.time() - burst_start < 1.0:
+                c_client.send_udp_audio(P_C * 40)
+                time.sleep(0.02)
+            c_client.send_udp_flush()
+            time.sleep(0.3)  # let stragglers arrive
+
+            msgs = a_client.recv_udp_all(timeout=0.5)
+            audio_payloads = [p for t, p in msgs if t == UDP_AUDIO]
+            leaked = [p for p in audio_payloads if P_C in p]
+
+            self.assertEqual(len(leaked), 0,
+                f"A has currentTG=9 (non-zero) and monitor_tgs=[110]. C is "
+                f"talking on TG 110. A received {len(leaked)} UDP audio "
+                f"frame(s) carrying TG 110 pattern P_C. Monitor-TG UDP audio "
+                f"must not reach a client whose selected TG is non-zero — "
+                f"svxlink's priority/auto-switch uses TCP TalkerStart, not "
+                f"UDP audio, to handle monitor activity. Total audio frames "
+                f"received: {len(audio_payloads)}.")
+        finally:
+            a_client.close()
+            c_client.close()
+
+    def test_46_inbound_heartbeat_timeout_no_crash(self):
+        """Regression: a non-paired trunk link whose inbound socket the
+        reflector closes on heartbeat timeout must not abort the process on
+        the next send (assert sock>=0 in AsyncTcpConnection::write).
+
+        Mirrors the production incident. TRUNK_TEST's outbound leg points at
+        the unroutable 192.0.2.1, so only the inbound leg (this mock peer) is
+        ever up. The peer goes silent; ~15s later the reflector times out the
+        inbound RX heartbeat and calls m_inbound_con->disconnect(), which does
+        NOT emit the disconnected signal -> onInboundDisconnected never runs,
+        so m_inbound_con stays non-null and m_ib_hello_received stays true and
+        isInboundReady() lies. A client then publishes a monitored-TG set that
+        is shared toward TRUNK_TEST (prefix 9); the resulting MsgPeerTgInterest
+        send falls through to sendMsgOnInbound, which writes to the closed
+        socket -> SIGABRT. With no restart policy the container then exits, so
+        /status becomes unreachable.
+        """
+        target = self.PRIMARY
+
+        # 1. Inbound-only trunk peer on TRUNK_TEST (its outbound leg is down).
+        peer = TrunkPeer()
+        peer.connect(*_trunk(target))
+        msg_type, _ = peer.handshake()  # TRUNK_TEST, prefix 9, test_secret
+        self.assertEqual(msg_type, MSG_TRUNK_HELLO)
+        wait_until(
+            lambda: get_status(*_http(target))["trunks"]["TRUNK_TEST"]
+                    .get("inbound_connected", False),
+            timeout=10.0, msg="TRUNK_TEST inbound did not connect")
+
+        client = None
+        try:
+            # 2. Go silent (send no heartbeats, keep the socket open) so the
+            #    reflector times out the inbound RX (HEARTBEAT_RX_CNT_RESET=15
+            #    @ 1s) and self-disconnects it. Do NOT peer.close() here: a
+            #    clean close fires the disconnected signal and cleans up.
+            #    The timeout log line has no /status equivalent on the buggy
+            #    build (inbound_connected stays true), so gate on the log.
+            wait_until(
+                lambda: "Inbound heartbeat timeout" in
+                        docker_logs_since(target, since="40s"),
+                timeout=30.0, interval=1.0,
+                msg="reflector did not time out the silent inbound trunk")
+
+            # 3. Trigger: a client publishes a monitored-TG set shared toward
+            #    TRUNK_TEST (prefix 9), scheduling a MsgPeerTgInterest on it.
+            shared_tg = int(TEST_PREFIX_FIRST + "123")  # e.g. 9123, owned by peer
+            client = ClientPeer()
+            client.connect(HOST, T.mapped_client_port(target))
+            client.authenticate()
+            client.monitor_tgs([shared_tg])
+
+            # 4. The 500ms TG-interest debounce fires the send. The reflector
+            #    must still be alive afterwards (no assert abort / exit).
+            time.sleep(2.0)
+            try:
+                get_status(*_http(target))
+            except Exception as e:
+                self.fail(
+                    f"reflector '{target}' crashed after inbound heartbeat "
+                    f"timeout + TG-interest send (write to closed socket): {e}")
+        finally:
+            if client is not None:
+                client.close()
+            peer.close()
+
+    def test_47_inbound_recovers_after_heartbeat_timeout(self):
+        """Robustness: after the reflector times out and drops a silent inbound
+        trunk peer, the same peer must be able to reconnect its inbound leg.
+
+        Guarding the send path alone stops the crash (test_46) but would leave
+        m_inbound_con dangling: /status would keep reporting a phantom inbound
+        and acceptInboundConnection (one inbound per non-paired link) would
+        reject every reconnect until the reflector restarts. The timeout path
+        must clear the inbound state so the link self-heals.
+        """
+        target = self.PRIMARY
+
+        # First inbound peer, then go silent until the reflector times it out.
+        peer1 = TrunkPeer()
+        peer1.connect(*_trunk(target))
+        self.assertEqual(peer1.handshake()[0], MSG_TRUNK_HELLO)
+        wait_until(
+            lambda: get_status(*_http(target))["trunks"]["TRUNK_TEST"]
+                    .get("inbound_connected", False),
+            timeout=10.0, msg="TRUNK_TEST inbound did not connect")
+        try:
+            # The reflector must clear the inbound from /status after timing it
+            # out — not leave a phantom that blocks reconnects.
+            wait_until(
+                lambda: not get_status(*_http(target))["trunks"]["TRUNK_TEST"]
+                        .get("inbound_connected", True),
+                timeout=30.0, interval=0.5,
+                msg="reflector left a phantom inbound after heartbeat timeout")
+        finally:
+            peer1.close()
+
+        # A fresh inbound from the same peer must now be accepted.
+        peer2 = TrunkPeer()
+        peer2.connect(*_trunk(target))
+        try:
+            self.assertEqual(peer2.handshake()[0], MSG_TRUNK_HELLO)
+            wait_until(
+                lambda: get_status(*_http(target))["trunks"]["TRUNK_TEST"]
+                        .get("inbound_connected", False),
+                timeout=10.0,
+                msg="TRUNK_TEST inbound did not recover after a timeout")
+        finally:
+            peer2.close()
+
+
+# ---------------------------------------------------------------------------
+# Custom test runner with clean, readable output
+# ---------------------------------------------------------------------------
+
+class TrunkTestResult(unittest.TestResult):
+    BOLD = "\033[1m"
+    GREEN = "\033[32m"
+    RED = "\033[31m"
+    YELLOW = "\033[33m"
+    DIM = "\033[2m"
+    RESET = "\033[0m"
+
+    def __init__(self, stream, verbosity=2):
+        super().__init__(stream, False, verbosity)
+        self.stream = stream
+        self.start_time = None
+        self.test_times = []
+
+    def startTest(self, test):
+        super().startTest(test)
+        self.start_time = time.monotonic()
+        # Print test name while running
+        label = test.shortDescription() or test._testMethodName
+        self.stream.write(f"  {self.DIM}running{self.RESET} {label}")
+        self.stream.flush()
+
+    def _finish(self, symbol, color, test, elapsed):
+        label = test.shortDescription() or test._testMethodName
+        self.test_times.append((label, elapsed))
+        # Clear line and rewrite with result
+        self.stream.write(f"\r\033[K  {color}{symbol}{self.RESET} {label}")
+        if elapsed >= 1.0:
+            self.stream.write(f"  {self.DIM}({elapsed:.1f}s){self.RESET}")
+        self.stream.write("\n")
+        self.stream.flush()
+
+    def addSuccess(self, test):
+        super().addSuccess(test)
+        self._finish("\u2714", self.GREEN, test, time.monotonic() - self.start_time)
+
+    def addFailure(self, test, err):
+        super().addFailure(test, err)
+        elapsed = time.monotonic() - self.start_time
+        self._finish("\u2718", self.RED, test, elapsed)
+
+    def addError(self, test, err):
+        super().addError(test, err)
+        elapsed = time.monotonic() - self.start_time
+        self._finish("!", self.RED, test, elapsed)
+
+    def addSkip(self, test, reason):
+        super().addSkip(test, reason)
+        elapsed = time.monotonic() - self.start_time
+        self._finish("-", self.YELLOW, test, elapsed)
+
+
+class TrunkTestRunner:
+    def __init__(self, stream=None):
+        self.stream = stream or __import__("sys").stderr
+
+    def run(self, test):
+        B = TrunkTestResult.BOLD
+        G = TrunkTestResult.GREEN
+        R = TrunkTestResult.RED
+        D = TrunkTestResult.DIM
+        RST = TrunkTestResult.RESET
+
+        result = TrunkTestResult(self.stream)
+        suite_start = time.monotonic()
+
+        self.stream.write(f"\n{B}Trunk Protocol Integration Tests{RST}\n")
+        self.stream.write(f"{D}{'─' * 50}{RST}\n")
+
+        test(result)
+        elapsed = time.monotonic() - suite_start
+
+        self.stream.write(f"{D}{'─' * 50}{RST}\n")
+
+        passed = result.testsRun - len(result.failures) - len(result.errors)
+        total = result.testsRun
+
+        if result.wasSuccessful():
+            self.stream.write(
+                f"{G}{B}{passed}/{total} passed{RST}  {D}({elapsed:.1f}s){RST}\n\n")
+        else:
+            self.stream.write(
+                f"{R}{B}{passed}/{total} passed, "
+                f"{len(result.failures)} failed, "
+                f"{len(result.errors)} errors{RST}  "
+                f"{D}({elapsed:.1f}s){RST}\n\n")
+
+            for test_case, traceback in result.failures + result.errors:
+                label = test_case.shortDescription() or test_case._testMethodName
+                self.stream.write(f"{R}{B}FAIL: {label}{RST}\n")
+                # Show only the last relevant line of the traceback
+                lines = traceback.strip().splitlines()
+                for line in lines:
+                    self.stream.write(f"  {D}{line}{RST}\n")
+                self.stream.write("\n")
+
+        return result
+
+
+def docker_log_lines(service: str, since_lines: int = 50) -> list:
+    """Get recent docker compose log lines for a service."""
+    import subprocess
+    result = subprocess.run(
+        ["docker", "compose", "-f", "docker-compose.test.yml",
+         "logs", "--tail", str(since_lines), service],
+        capture_output=True, text=True, timeout=5)
+    return result.stdout.strip().splitlines()
+
+
+def interactive_loop():
+    """Let user manually test TGs against the running mesh via a V2 client.
+
+    Connects a V2 client, sends audio to trigger the talker, then checks
+    docker logs on each reflector for routing evidence.
+    """
+    B = "\033[1m"
+    G = "\033[32m"
+    R = "\033[31m"
+    D = "\033[2m"
+    RST = "\033[0m"
+
+    target = REFLECTOR_NAMES[0]
+
+    print(f"\n{B}Interactive TG tester{RST}  {D}(mesh is still running){RST}")
+    print()
+    print(f"  {B}Topology:{RST}")
+    for name in REFLECTOR_NAMES:
+        pfx = T.prefix_str(T.REFLECTORS[name]["prefix"])
+        marker = " \u25c0 client connects here" if name == target else ""
+        print(f"    reflector-{name}  {B}prefix={pfx}{RST}{D}{marker}{RST}")
+    cluster = ", ".join(str(tg) for tg in T.CLUSTER_TGS)
+    print(f"    {D}cluster TGs:  {B}{cluster}{RST}")
+    print()
+    print(f"  {D}Connects as V2 client ({CLIENT_CALLSIGN}) to reflector-{target}.")
+    print(f"  Any TG can be tested — routing forwards to the owning reflector.")
+    print(f"  Routing is verified via reflector logs (not /status polling).")
+    print(f"  Type 'q' or press Ctrl-C to exit{RST}\n")
+
+    while True:
+        try:
+            raw = input(f"{B}TG number{RST} {D}(q to quit):{RST} ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+
+        if not raw or raw.lower() == "q":
+            break
+
+        try:
+            tg = int(raw)
+        except ValueError:
+            print(f"  {R}not a valid number{RST}")
+            continue
+
+        client = ClientPeer()
+        try:
+            client_port = T.mapped_client_port(target)
+            client.connect(HOST, client_port)
+            client.authenticate()
+            client.setup_udp(udp_port=client_port)
+            client.select_tg(tg)
+            time.sleep(0.3)
+
+            # Send audio to trigger the talker
+            for _ in range(5):
+                client.send_udp_audio(b"\x00" * 160)
+                time.sleep(0.02)
+
+            # Give the reflector time to process and forward
+            time.sleep(0.5)
+            client.close()
+            client = None
+            time.sleep(0.3)
+
+            # Check docker logs on each reflector for routing evidence
+            tg_str = str(tg)
+            print(f"  {D}logs for TG {B}{tg}{RST}{D}:{RST}")
+            found_local = False
+            found_trunk = False
+
+            for name in REFLECTOR_NAMES:
+                svc = T.service_name(name)
+                lines = docker_log_lines(svc, since_lines=30)
+
+                events = []
+                tg_pattern = re.compile(rf"TG #{tg_str}(?!\d)")
+                for line in lines:
+                    if not tg_pattern.search(line):
+                        continue
+                    # Extract the event part after the container prefix
+                    parts = line.split("|", 1)
+                    msg = parts[-1].strip() if len(parts) > 1 else line.strip()
+
+                    if "Talker start" in msg and "Trunk" not in msg:
+                        events.append(f"{G}local talker start{RST}")
+                        found_local = True
+                    elif "Talker stop" in msg and "Trunk" not in msg:
+                        events.append(f"{D}local talker stop{RST}")
+                    elif "Trunk talker start" in msg:
+                        events.append(f"{G}trunk talker start{RST}")
+                        found_trunk = True
+                    elif "Trunk talker stop" in msg:
+                        events.append(f"{D}trunk talker stop{RST}")
+
+                if events:
+                    print(f"    reflector-{name}: {', '.join(events)}")
+                else:
+                    print(f"    reflector-{name}: {D}(no events){RST}")
+
+            # Summary
+            if found_local and found_trunk:
+                print(f"  {G}\u2714{RST} TG {B}{tg}{RST} routed via trunk")
+            elif found_local and not found_trunk:
+                target_prefixes = T.prefix_list(T.REFLECTORS[target]["prefix"])
+                is_local = any(tg_str.startswith(p) for p in target_prefixes)
+                if is_local:
+                    print(f"  {G}\u2714{RST} TG {B}{tg}{RST} is local to reflector-{target}")
+                else:
+                    all_prefixes = []
+                    for n in REFLECTOR_NAMES:
+                        all_prefixes.extend(T.prefix_list(T.REFLECTORS[n]["prefix"]))
+                    has_owner = any(tg_str.startswith(p) for p in all_prefixes)
+                    if has_owner:
+                        print(f"  {R}\u2718{RST} TG {B}{tg}{RST} talker started locally "
+                              f"but trunk forwarding not seen in logs")
+                    else:
+                        print(f"  {D}\u2714{RST} TG {B}{tg}{RST} talker started locally "
+                              f"{D}(no remote prefix owns this TG){RST}")
+            elif not found_local:
+                print(f"  {R}\u2718{RST} TG {B}{tg}{RST} no talker start seen "
+                      f"{D}(audio may not have reached the reflector){RST}")
+
+        except Exception as e:
+            print(f"  {R}error: {e}{RST}")
+        finally:
+            if client is not None:
+                client.close()
+
+        print()
+
+
+if __name__ == "__main__":
+    runner = TrunkTestRunner()
+    suite = unittest.TestLoader().loadTestsFromTestCase(TestTrunkIntegration)
+    result = runner.run(suite)
+
+    if not result.wasSuccessful():
+        raise SystemExit(1)
+
+    try:
+        interactive_loop()
+    except Exception:
+        pass

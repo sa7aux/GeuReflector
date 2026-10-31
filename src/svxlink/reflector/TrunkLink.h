@@ -1,0 +1,368 @@
+/**
+@file    TrunkLink.h
+@brief   Server-to-server trunk link between two SvxReflector instances
+@date    2026-03-20
+
+\verbatim
+SvxReflector - An audio reflector for connecting SvxLink Servers
+Copyright (C) 2003-2026 Tobias Blomberg / SM0SVX
+
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation; either version 2 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program; if not, write to the Free Software
+Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+\endverbatim
+*/
+
+#ifndef TRUNK_LINK_INCLUDED
+#define TRUNK_LINK_INCLUDED
+
+
+/****************************************************************************
+ *
+ * System Includes
+ *
+ ****************************************************************************/
+
+#include <set>
+#include <map>
+#include <string>
+#include <vector>
+#include <sigc++/sigc++.h>
+#include <json/json.h>
+
+
+/****************************************************************************
+ *
+ * Project Includes
+ *
+ ****************************************************************************/
+
+#include <AsyncConfig.h>
+#include <AsyncTcpPrioClient.h>
+#include <AsyncFramedTcpConnection.h>
+#include <AsyncTimer.h>
+
+#include "TgFilter.h"
+#include "ReflectorMsg.h"
+
+
+/****************************************************************************
+ *
+ * Forward declarations
+ *
+ ****************************************************************************/
+
+class Reflector;
+class ReflectorMsg;
+class MsgPeerHello;
+class MsgUdpAudio;
+
+
+/****************************************************************************
+ *
+ * Class definitions
+ *
+ ****************************************************************************/
+
+/**
+@brief  Manages a persistent TCP trunk link to a peer SvxReflector
+
+One TrunkLink instance is created per [TRUNK_x] config section. It maintains
+two independent TCP connections to the peer:
+  - An outbound connection (TcpPrioClient) that we initiate and auto-reconnects
+  - An inbound connection accepted from the peer via the trunk server
+
+Both connections coexist independently. Data messages are sent on the outbound
+connection (with inbound as fallback). Heartbeats are sent on each connection
+independently to detect dead sockets.
+
+Talker arbitration tie-break: each side generates a random 32-bit priority at
+startup and exchanges it in MsgPeerHello. When both sides claim the same TG
+simultaneously, the side with the lower priority value defers (clears its local
+talker and accepts the remote one).
+*/
+class TrunkLink : public sigc::trackable
+{
+  public:
+    TrunkLink(Reflector* reflector, Async::Config& cfg,
+              const std::string& section);
+    ~TrunkLink(void);
+
+    bool initialize(void);
+
+    bool isSharedTG(uint32_t tg) const;
+    // True if tg matches an explicit ROUTABLE_PREFIXES entry on this link,
+    // or the "*" wildcard is set. Per-link; used by the inbound-accept gate.
+    bool matchesRoutable(uint32_t tg) const;
+    void setAllPrefixes(const std::vector<std::string>& all_prefixes)
+    {
+      m_all_prefixes = all_prefixes;
+    }
+    const std::string& section(void) const { return m_section; }
+    const std::string& peerId(void) const
+    {
+      return m_peer_id_received.empty() ? m_section : m_peer_id_received;
+    }
+
+    Json::Value statusJson(void) const;
+
+    const std::string& secret(void) const { return m_secret; }
+    const std::vector<std::string>& remotePrefix(void) const
+    {
+      return m_remote_prefix;
+    }
+    const std::vector<std::string>& routablePrefixes(void) const
+    {
+      return m_routable_prefixes;
+    }
+    // Read-only view of TGs the peer is interested in (TalkerStart activity
+    // or MsgPeerTgInterest advertisement). Used by Reflector to aggregate
+    // interest for re-advertisement toward the prefix owner.
+    const std::map<uint32_t, time_t>& peerInterestedTGs(void) const
+    {
+      return m_peer_interested_tgs;
+    }
+    // 10 minutes of inactivity expires a peer-interest entry. Public so the
+    // Reflector aggregator can apply the same staleness filter when
+    // composing re-advertisements toward the prefix owner.
+    static const time_t PEER_INTEREST_TIMEOUT_S = 600;
+
+    bool isPaired(void) const { return m_paired; }
+    bool hasRoutableWildcard(void) const { return m_routable_wildcard; }
+    bool hasInboundConnection(void) const
+    {
+      return m_paired ? !m_ib_cons.empty() : (m_inbound_con != nullptr);
+    }
+    // True when at least one direction (inbound or outbound) is ready.
+    bool isActive(void) const;
+
+    // Accept an inbound connection from a peer that has already sent a hello
+    void acceptInboundConnection(Async::FramedTcpConnection* con,
+                                  const MsgPeerHello& hello);
+
+    // Called by Reflector when the inbound connection disconnects
+    void onInboundDisconnected(Async::FramedTcpConnection* con,
+        Async::FramedTcpConnection::DisconnectReason reason);
+
+    // Called by Reflector when a local client starts/stops on a shared TG
+    void onLocalTalkerStart(uint32_t tg, const std::string& callsign);
+    void onLocalTalkerStop(uint32_t tg);
+
+    // Called by Reflector for each audio frame from a local talker on a shared TG
+    void onLocalAudio(uint32_t tg, const std::vector<uint8_t>& audio);
+
+    // Called by Reflector when a local talker's audio stream ends
+    void onLocalFlush(uint32_t tg);
+
+    // Send the local node list (callsign + current TG per local client)
+    // to the peer. Called from Reflector after debounce.
+    void sendNodeList(const std::vector<MsgPeerNodeList::NodeEntry>& nodes);
+
+    // Schedule a debounced advertisement of TG interest to this peer. The
+    // local-interest set (selected tg + monitoredTGs of every connected
+    // client) is supplied by the caller; the link unions it with interest
+    // re-routed from other peers (longest-prefix-match toward the owner)
+    // before sending. Coalesces multiple calls within the debounce window.
+    void scheduleTgInterestRefresh(const std::set<uint32_t>& local_interest);
+
+    // PTY-driven controls
+    void muteCallsign(const std::string& callsign)
+    {
+      m_muted_callsigns.insert(callsign);
+    }
+    void unmuteCallsign(const std::string& callsign)
+    {
+      m_muted_callsigns.erase(callsign);
+    }
+    bool isCallsignMuted(const std::string& callsign) const
+    {
+      return m_muted_callsigns.count(callsign) > 0;
+    }
+    const std::set<std::string>& mutedCallsigns(void) const
+    {
+      return m_muted_callsigns;
+    }
+    // Re-parse BLACKLIST_TGS, ALLOW_TGS and TG_MAP from current config
+    void reloadConfig(void);
+    // One-line summary for TRUNK STATUS
+    std::string statusLine(void) const;
+
+  private:
+    static const unsigned HEARTBEAT_TX_CNT_RESET = 10;
+    static const unsigned HEARTBEAT_RX_CNT_RESET = 15;
+
+    using FramedTcpClient =
+        Async::TcpPrioClient<Async::FramedTcpConnection>;
+
+    Reflector*          m_reflector;
+    Async::Config&      m_cfg;
+    std::string         m_section;
+    std::string         m_peer_host;
+    uint16_t            m_peer_port;
+    std::string         m_secret;
+    std::string         m_peer_id_config;    // our hello id (from PEER_ID; defaults to section)
+    std::string         m_peer_id_received;  // peer's hello id (set on hello rx)
+    std::vector<std::string> m_local_prefix;   // our authoritative TG prefixes
+    std::vector<std::string> m_remote_prefix;  // peer's authoritative TG prefixes
+    std::vector<std::string> m_routable_prefixes;  // explicit ROUTABLE_PREFIXES (non-"*")
+    bool                     m_routable_wildcard = false;  // "*" present
+    uint32_t            m_priority;       // our tie-break nonce (random, set once)
+    uint32_t            m_peer_priority;  // peer's nonce, from MsgPeerHello
+    FramedTcpClient     m_con;            // outbound client connection
+    Async::FramedTcpConnection* m_inbound_con = nullptr;  // accepted inbound
+    Async::Timer        m_heartbeat_timer;
+    std::vector<std::string> m_all_prefixes;   // all prefixes in the mesh
+    TgFilter            m_blacklist_filter;    // TGs never carried on this link
+    TgFilter            m_allow_filter;        // if non-empty: only these TGs pass
+    std::map<uint32_t, uint32_t> m_tg_map_in;  // peer wire TG -> local TG
+    std::map<uint32_t, uint32_t> m_tg_map_out; // local TG -> peer wire TG
+    std::set<std::string>        m_muted_callsigns;
+    // TGs where we suppressed our local talker to defer to the peer
+    std::set<uint32_t>  m_yielded_tgs;
+    // TGs currently held by this specific trunk peer (for scoped cleanup)
+    std::set<uint32_t>  m_peer_active_tgs;
+
+    // Most recent MsgPeerNodeList we received from the peer, sanitized.
+    // Surfaced in statusJson() so /status can attribute nodes to a peer.
+    // Cleared when the link goes fully inactive.
+    std::vector<MsgPeerNodeList::NodeEntry> m_partner_nodes;
+
+    // TGs the peer has shown interest in (sent TalkerStart for, or advertised
+    // via MsgPeerTgInterest).  Maps TG number to last activity timestamp.
+    // Entries expire after PEER_INTEREST_TIMEOUT_S seconds of inactivity.
+    std::map<uint32_t, time_t> m_peer_interested_tgs;
+
+    // TG-interest advertisement state. Heartbeat refresh is paced loosely
+    // against PEER_INTEREST_TIMEOUT_S; debounce coalesces edge-triggered
+    // updates so e.g. a client toggling its monitor list does not blast
+    // the wire. Last-sent set lets us skip the heartbeat send when nothing
+    // has changed since the previous transmission.
+    static const unsigned TG_INTEREST_HEARTBEAT_MS = 60 * 1000;
+    static const unsigned TG_INTEREST_DEBOUNCE_MS  = 500;
+    Async::Timer       m_tg_interest_timer;     // periodic refresh
+    Async::Timer       m_tg_interest_debounce;  // one-shot, edge-triggered
+    std::set<uint32_t> m_local_tg_interest;     // last seen local set
+    std::set<uint32_t> m_last_sent_tg_interest; // last set actually sent
+
+    // PAIRED mode: one logical peer backed by multiple physical hosts
+    bool                                          m_paired = false;
+    std::vector<std::string>                      m_peer_hosts;  // HOST=h1,h2,...
+    std::vector<FramedTcpClient*>                 m_ob_cons;     // per-host outbound (D2)
+    std::vector<Async::FramedTcpConnection*>      m_ib_cons;     // per-host inbound (D3)
+    size_t                                        m_sticky_ob_idx = 0;  // sticky send socket (D4)
+
+    // Per-connection state
+    bool                m_ob_hello_received = false;
+    unsigned            m_ob_hb_tx_cnt = 0;
+    unsigned            m_ob_hb_rx_cnt = 0;
+    bool                m_ib_hello_received = false;
+    unsigned            m_ib_hb_tx_cnt = 0;
+    unsigned            m_ib_hb_rx_cnt = 0;
+
+    TrunkLink(const TrunkLink&);
+    TrunkLink& operator=(const TrunkLink&);
+
+    bool isOutboundReady(void) const;
+    bool isInboundReady(void) const;
+    bool isOwnedTG(uint32_t tg) const;
+    bool isPeerInterestedTG(uint32_t tg) const;
+    bool isBlacklisted(uint32_t tg) const;
+    bool isAllowed(uint32_t tg) const;
+    uint32_t mapTgIn(uint32_t peer_tg) const
+    {
+      auto it = m_tg_map_in.find(peer_tg);
+      return (it != m_tg_map_in.end()) ? it->second : peer_tg;
+    }
+    uint32_t mapTgOut(uint32_t local_tg) const
+    {
+      auto it = m_tg_map_out.find(local_tg);
+      return (it != m_tg_map_out.end()) ? it->second : local_tg;
+    }
+
+    void onConnected(void);
+    void onDisconnected(Async::TcpConnection* con,
+                        Async::TcpConnection::DisconnectReason reason);
+    void onFrameReceived(Async::FramedTcpConnection* con,
+                         std::vector<uint8_t>& data);
+
+    void handleMsgPeerHello(std::istream& is, bool is_inbound);
+    void handleMsgPeerTalkerStart(std::istream& is);
+    void handleMsgPeerTalkerStop(std::istream& is);
+    void handleMsgPeerAudio(std::istream& is);
+    void handleMsgPeerFlush(std::istream& is);
+    void handleMsgPeerHeartbeat(void);
+    void handleMsgPeerNodeList(std::istream& is);
+    void handleMsgPeerTgInterest(std::istream& is);
+
+    // force=true bypasses skip-when-unchanged so the periodic 60 s
+    // heartbeat refreshes the receiver's m_peer_interested_tgs TTL.
+    void sendTgInterest(bool force = false);
+    void onTgInterestTimer(Async::Timer* t);
+    void onTgInterestDebounce(Async::Timer* t);
+    // Build the set we should advertise to this peer: local interest, plus
+    // TGs we have learned from other peers whose longest-prefix-match in
+    // m_all_prefixes points at this peer (gateway re-advertisement).
+    std::set<uint32_t> buildOutgoingTgInterest(void) const;
+
+    void sendMsg(const ReflectorMsg& msg);
+    void sendMsgOnOutbound(const ReflectorMsg& msg);
+    void sendMsgOnInbound(const ReflectorMsg& msg);
+    void heartbeatTick(Async::Timer* t);
+    void clearPeerTalkerState(void);
+
+    // PAIRED mode: per-host outbound client handlers (D2)
+    void onPairedOutboundConnected(FramedTcpClient* client);
+    void onPairedOutboundDisconnected(FramedTcpClient* client,
+                                      Async::TcpConnection* con,
+                                      Async::TcpConnection::DisconnectReason reason);
+    void onPairedOutboundFrame(FramedTcpClient* client,
+                               Async::FramedTcpConnection* con,
+                               std::vector<uint8_t>& data);
+    size_t pairedClientIndex(FramedTcpClient* client) const;
+    void sendMsgOnPairedOutbound(size_t idx, const ReflectorMsg& msg);
+
+    // PAIRED mode: per-host inbound connection handlers (D3)
+    void onPairedInboundFrame(Async::FramedTcpConnection* con,
+                               std::vector<uint8_t>& data);
+    void onPairedInboundDisconnected(Async::FramedTcpConnection* con,
+        Async::FramedTcpConnection::DisconnectReason reason);
+    size_t pairedInboundIndex(Async::FramedTcpConnection* con) const;
+    void sendMsgOnPairedInbound(size_t idx, const ReflectorMsg& msg);
+
+    // Per-client handshake/heartbeat state for paired outbound connections
+    struct PairedClientState
+    {
+      bool     hello_received = false;
+      unsigned hb_tx_cnt      = 0;
+      unsigned hb_rx_cnt      = 0;
+    };
+    std::vector<PairedClientState> m_ob_states;  // parallel to m_ob_cons
+
+    // Per-inbound handshake/heartbeat state for paired inbound connections
+    struct PairedInboundState
+    {
+      bool     hello_received = false;
+      unsigned hb_tx_cnt      = 0;
+      unsigned hb_rx_cnt      = 0;
+    };
+    std::vector<PairedInboundState> m_ib_states;  // parallel to m_ib_cons
+
+};  /* class TrunkLink */
+
+
+#endif /* TRUNK_LINK_INCLUDED */
+
+
+/*
+ * This file has not been truncated
+ */

@@ -1,0 +1,854 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>GeuReflector — Mesh Topology Examples</title>
+<style>
+  @page {
+    size: A4;
+    margin: 22mm 18mm 20mm 18mm;
+    @bottom-left {
+      content: "GeuReflector — Mesh Topology Examples  ·  PDF generated __BUILD_DATE__";
+      font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+      font-size: 9pt;
+      color: #5f6368;
+      white-space: nowrap;
+    }
+    @bottom-right {
+      content: counter(page) " / " counter(pages);
+      font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+      font-size: 9pt;
+      color: #5f6368;
+    }
+  }
+  @page :first {
+    margin: 0;
+    @bottom-left  { content: ""; }
+    @bottom-right { content: ""; }
+  }
+
+  html { font-family: "Helvetica Neue", Helvetica, Arial, sans-serif; }
+  body { color: #202124; line-height: 1.55; font-size: 10.5pt; }
+
+  h1, h2, h3, h4 { font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+               color: #202124; line-height: 1.25; }
+  h1 { font-size: 22pt; margin: 0 0 6pt 0; }
+  h2 { font-size: 16pt; margin: 18pt 0 6pt 0;
+       border-bottom: 1pt solid #dadce0; padding-bottom: 3pt;
+       page-break-after: avoid; }
+  h3 { font-size: 12pt; margin: 14pt 0 4pt 0;
+       color: #1a4fa3; page-break-after: avoid; }
+  h4 { font-size: 10.5pt; margin: 12pt 0 4pt 0; color: #1e7d34;
+       page-break-after: avoid; }
+
+  p { margin: 0 0 6pt 0; }
+  strong { color: #1a4fa3; }
+
+  code { font-family: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+         background: #f1f3f4; color: #c0531c;
+         padding: 0.5pt 3pt; border-radius: 3pt; font-size: 9pt;
+         /* JetBrains Mono ligates ">=" into a single glyph, which would
+            silently swallow the ">" in tokens like SECRET_<id>=. */
+         font-variant-ligatures: none; }
+
+  table { border-collapse: collapse; margin: 8pt 0 12pt 0; width: 100%;
+          font-size: 9.5pt; page-break-inside: avoid; }
+  th { background: #f4f8ff; color: #1a4fa3; text-align: left;
+       padding: 4pt 6pt; border-bottom: 1pt solid #1a4fa3; font-weight: 600; }
+  td { padding: 4pt 6pt; border-bottom: 0.5pt solid #e8eaed;
+       vertical-align: top; }
+  tr:last-child td { border-bottom: none; }
+
+  ul { margin: 4pt 0 8pt 18pt; padding: 0; }
+  li { margin-bottom: 3pt; }
+
+  /* Cover page */
+  .cover {
+    height: 297mm; width: 210mm;
+    margin: 0; padding: 0;
+    display: flex; flex-direction: column;
+    justify-content: center; align-items: center;
+    text-align: center;
+    background: linear-gradient(180deg, #f4f8ff 0%, #ffffff 100%);
+    page-break-after: always;
+    box-sizing: border-box;
+  }
+  .cover .eyebrow {
+    text-transform: uppercase; letter-spacing: 4pt; font-size: 11pt;
+    color: #c0531c; font-weight: 600; margin-bottom: 24pt;
+  }
+  .cover h1 {
+    font-size: 36pt; margin: 0; max-width: 75%;
+    color: #1a4fa3; line-height: 1.15;
+  }
+  .cover .subtitle {
+    font-size: 14pt; color: #5f6368; margin-top: 18pt; max-width: 70%;
+  }
+  .cover .tagline {
+    font-size: 11.5pt; color: #c0531c; margin-top: 28pt; max-width: 72%;
+    font-style: italic;
+  }
+  .cover .credits {
+    font-size: 9.5pt; color: #5f6368; margin-top: 18pt; max-width: 72%;
+    line-height: 1.6;
+  }
+  .cover .credits a { color: #1a4fa3; text-decoration: none; }
+  .cover .footer {
+    position: absolute; bottom: 22mm; font-size: 9.5pt; color: #5f6368;
+    text-align: center; line-height: 1.5;
+  }
+  .cover .footer a { color: #1a4fa3; text-decoration: none; }
+
+  /* Diagram container */
+  figure {
+    margin: 10pt 0 10pt 0; text-align: center;
+    page-break-inside: avoid;
+  }
+  figure img { max-width: 100%; max-height: 110mm; }
+  figcaption {
+    font-size: 9pt; color: #5f6368; margin-top: 4pt;
+    font-style: italic;
+  }
+
+  /* Callouts */
+  .note {
+    background: #fff8e1; border-left: 3pt solid #f0a800;
+    padding: 8pt 12pt; margin: 10pt 0; font-size: 10pt;
+    border-radius: 2pt; page-break-inside: avoid;
+  }
+  .note .label {
+    display: inline-block; font-weight: 700; color: #a37300;
+    margin-right: 6pt; text-transform: uppercase; letter-spacing: 0.5pt;
+    font-size: 8.5pt;
+  }
+
+  .legend {
+    display: flex; flex-wrap: wrap; gap: 14pt; font-size: 9.5pt;
+    margin: 6pt 0 10pt 0; padding: 6pt 10pt;
+    background: #f8f9fa; border-radius: 4pt;
+  }
+  .legend .swatch {
+    display: inline-block; width: 14pt; height: 10pt; border-radius: 2pt;
+    vertical-align: middle; margin-right: 4pt; border: 1.5pt solid;
+  }
+  .legend .gw    { background: #fde2d4; border-color: #c0531c; }
+  .legend .intl  { background: #dde8fb; border-color: #1a4fa3; }
+  .legend .zone  { background: #dff3e0; border-color: #1e7d34; }
+  .legend .sat   { background: #fff4d6; border-color: #a37300;
+                   border-style: dashed; }
+  .legend .twin  { background: #e6dcff; border-color: #5430a8; }
+  .legend .nodes { background: #eceff1; border-color: #5f6368;
+                   border-style: dashed; }
+  .legend .trunk-line {
+    display: inline-block; width: 18pt; height: 2pt; background: #5f6368;
+    vertical-align: middle; margin-right: 4pt;
+  }
+  .legend .sat-line {
+    display: inline-block; width: 18pt; border-top: 2pt dashed #a37300;
+    vertical-align: middle; margin-right: 4pt;
+  }
+  .legend .twin-line {
+    display: inline-block; width: 18pt; height: 3pt; background: #5430a8;
+    vertical-align: middle; margin-right: 4pt;
+  }
+
+  section { page-break-inside: auto; }
+  section.topology { page-break-before: always; }
+</style>
+</head>
+<body>
+
+<div class="cover">
+  <div class="eyebrow">GeuReflector documentation</div>
+  <h1>Mesh Topology Examples</h1>
+  <div class="subtitle">
+    A visual cookbook of trunk, satellite and twin layouts —
+    European running example with Italian BrandMeister Zone prefixes
+  </div>
+  <div class="tagline">
+    GeuReflector — an extended fork of SvxReflector. Drop-in replacement
+    for the upstream <code>svxreflector</code> that adds trunks, twins,
+    satellites, filters and more.
+  </div>
+  <div class="credits">
+    Built on the SvxLink project by SM0SVX —
+    <a href="https://github.com/sm0svx/svxlink">github.com/sm0svx/svxlink</a><br>
+    Thanks to DG1FI, DJ1JAY, SA2BLV, UR3QJW, YO6NAM and others for their
+    interest, testing, debugging, suggestions, and contributions.
+  </div>
+  <div class="footer">
+    PDF generated __BUILD_DATE__<br>
+    <a href="https://github.com/audric/GeuReflector">github.com/audric/GeuReflector</a>
+  </div>
+</div>
+
+<section>
+<h2>Background</h2>
+
+<p>GeuReflector links separate reflector instances in two distinct ways:</p>
+
+<p><strong>Trunk</strong> (TCP <code>:5302</code>) — bidirectional, designed for
+full-mesh peering. Each peer owns one or more numeric prefixes. TG routing is
+by <strong>longest-prefix-match</strong> against the union of all prefixes in
+the mesh (every <code>TrunkLink</code> learns the full table at startup).
+Audio relay is <strong>single-hop</strong>: only the prefix owner fans audio
+out to other interested peers. Non-owners that receive trunk audio deliver it
+locally and stop. The source peer is excluded from the owner's fanout to
+prevent loops.</p>
+
+<p><strong>Satellite</strong> (TCP <code>:5303</code>) — one-to-many star.
+A satellite reflector connects out to a parent reflector and mirrors TGs in
+both directions. An optional <code>SATELLITE_FILTER</code> on the satellite
+side scopes the mirrored set in <strong>both</strong> directions: the satellite
+suppresses non-matching outbound, and the parent learns the filter via
+<code>MsgPeerFilter</code> (type 122) and drops non-matching forwards going
+down.</p>
+
+<p>Two other behaviours show up repeatedly in the flow descriptions below:</p>
+
+<ul>
+  <li><strong>Peer interest</strong> is populated either when a peer emits
+      <code>PeerTalkerStart</code> / <code>PeerAudio</code> on a TG, or
+      proactively when a peer advertises its local clients' selected /
+      monitored TGs via <code>MsgPeerTgInterest</code> (type 129). The
+      proactive path means a passive listener — a SvxLink node that has
+      selected a foreign TG or added it to <code>monitoredTGs</code> without
+      keying — registers as interested at the owner without first
+      transmitting; the receiver re-advertises one hop further toward the
+      owner so multi-hop national-mesh layouts (§2) propagate correctly.
+      Interest expires after <strong>10 minutes</strong> of inactivity on
+      that TG from that peer (or immediately on trunk disconnect).</li>
+  <li><strong>MCC-style country prefixes</strong> are used for the
+      international mesh: IT = <code>222</code>, SE = <code>240</code>,
+      DE = <code>262</code>. Reusing the DMR MCC layout makes ownership
+      self-documenting.</li>
+</ul>
+
+<div class="legend">
+  <span><span class="swatch gw"></span>Italian gateway (focus)</span>
+  <span><span class="swatch intl"></span>Foreign country gateway</span>
+  <span><span class="swatch zone"></span>Italian Zone reflector</span>
+  <span><span class="swatch sat"></span>Satellite reflector</span>
+  <span><span class="swatch twin"></span>Twin (HA pair)</span>
+  <span><span class="swatch nodes"></span>Local SvxLink nodes (clients)</span>
+  <span><span class="trunk-line"></span>Trunk link (port :5302)</span>
+  <span><span class="sat-line"></span>Satellite mirror (port :5303)</span>
+  <span><span class="twin-line"></span>Twin link</span>
+</div>
+</section>
+
+<section class="topology">
+<h2>1. International full-mesh</h2>
+
+<p>Country gateways only. Every reflector owns its country's MCC and trunks
+directly to every other country.</p>
+
+<figure>
+  <img src="01_intl_mesh.svg" alt="International full mesh">
+  <figcaption>Diagram 1 — Three European country gateways in a full trunk mesh.
+  Every pair has a bidirectional trunk over port :5302 with HMAC handshake.</figcaption>
+</figure>
+
+<h3>Routing</h3>
+<p>TG <code>240xx</code> → SE · TG <code>262xx</code> → DE ·
+   TG <code>222xx</code> → IT.</p>
+
+<h3>Flow</h3>
+<p>An SE client keys TG <code>22299</code>. SE's prefix table maps
+<code>222 → IT</code>, so SE sends to IT. IT delivers locally and fans the
+audio out to DE (if it has shown interest in <code>22299</code> recently);
+SE is excluded as the source.</p>
+
+<p>This layer is the foundation. Everything else stacks on top of it.</p>
+</section>
+
+<section class="topology">
+<h2>2. National trunk topology joined at the country gateway</h2>
+
+<p>Italy adds per-Zone reflectors that form a <strong>national trunk
+mesh</strong> together with IT 222. Foreign countries see only
+IT 222 — the Zone prefixes are not advertised internationally. The country
+gateway is the <strong>hinge</strong> between the international mesh and the
+national mesh.</p>
+
+<figure>
+  <img src="02_flat_mesh.svg" alt="National mesh joined at IT 222">
+  <figcaption>Diagram 2 — Two domains sharing a single node: the international
+  trunk mesh on the left and the Italian national trunk mesh on the right,
+  joined at IT 222. (Z5..Z9 omitted; same pattern.)</figcaption>
+</figure>
+
+<h3>Italian Zone prefixes (BrandMeister)</h3>
+<table>
+  <tr><th>Prefix</th><th>Reflector</th><th>Coverage</th></tr>
+  <tr><td><code>2221</code></td><td>IT-Z1</td><td>Nord-Ovest (Liguria, Piemonte, Val d'Aosta)</td></tr>
+  <tr><td><code>2222</code></td><td>IT-Z2</td><td>Lombardia</td></tr>
+  <tr><td><code>2223</code></td><td>IT-Z3</td><td>Triveneto (FVG, Trentino-AA, Veneto)</td></tr>
+  <tr><td><code>2224</code></td><td>IT-Z4</td><td>Emilia-Romagna</td></tr>
+  <tr><td><code>2225</code></td><td>IT-Z5</td><td>Toscana</td></tr>
+  <tr><td><code>2226</code> – <code>2229</code></td><td>IT-Z6..Z9</td><td>Centro, Puglia, Sud, Sicilia</td></tr>
+</table>
+
+<h3>Ownership vs. reachability</h3>
+<p>Each reflector's prefix table is built from <em>its own</em> config:
+local prefix plus the <code>REMOTE_PREFIX</code> of each
+<code>[TRUNK_x]</code> section. Prefixes are not gossiped between peers.
+That means SE only knows the prefixes it has trunks for — namely
+<code>222</code> (IT) and <code>262</code> (DE). SE has no idea that
+<code>2222</code> exists, even though Z2 owns it inside Italy.</p>
+
+<table>
+  <tr><th>TG</th><th>Owner (globally)</th><th>SE's view</th><th>IT 222's view</th></tr>
+  <tr><td><code>22221</code></td><td>IT-Z2 (longest match <code>2222</code>)</td>
+      <td>only <code>222</code> matches → send to IT 222</td>
+      <td><code>2222</code> matches → Z2 is owner</td></tr>
+  <tr><td><code>22299</code></td><td>IT 222 (only <code>222</code> matches)</td>
+      <td>send to IT 222</td><td>own this TG</td></tr>
+  <tr><td><code>2629</code></td><td>DE (only <code>262</code> matches)</td>
+      <td>send to DE</td><td>send to DE</td></tr>
+</table>
+
+<h3>Flow</h3>
+<p>A <strong>Z2 client</strong> keying <code>22221</code> (Lombardia): Z2
+owns <code>2222</code>, so it plays locally and fans out on the trunk side
+to interested peers in the national mesh — IT 222 and the other Zones. It
+does <em>not</em> trunk-forward to SE/DE (it has no trunks to them).</p>
+
+<p>An <strong>SE client</strong> keying the same <code>22221</code>: SE's
+table has only <code>222</code> as a match, so it sends to IT 222 thinking
+IT is the owner. IT 222 receives it, sees that Z2 actually owns
+<code>2222</code> in its own trunk table, and <strong>bridges the frame
+onward to Z2</strong> via the gateway-routing path
+(<code>Reflector::shouldRelayInbound</code> returns true because IT has a
+prefix route for <code>2222</code>). Z2 plays locally and fans the audio
+out to its national peers (excluding IT as the source). The return leg
+works the same way: audio from a Z3 client reaches SE because IT's
+<code>isPeerInterestedTG</code> for <code>22221</code> was registered on
+the SE side — either by a previous PTT from SE, or proactively as soon as
+the Swedish operator selected (or monitored) <code>22221</code> on their
+SvxLink node, via <code>MsgPeerTgInterest</code> (type 129).</p>
+
+<p><strong>Reaching international TGs <em>from</em> a Zone &mdash;
+<code>ROUTABLE_PREFIXES</code>.</strong> The gateway routing above carries a
+<em>foreign</em> talker <em>into</em> a Zone. The opposite direction &mdash; a
+<strong>Zone client calling an international TG</strong> (say DE
+<code>2629</code>, or any TG owned out in the international mesh) &mdash; does
+<strong>not</strong> work by default: a Zone's prefix table holds only
+<code>222</code> and the other Zone prefixes, so <code>2629</code> matches
+nothing, has no owner, and stays local. To open that path, declare the foreign
+prefixes as routable via the gateway on the Zone's uplink to IT 222 &mdash; e.g.
+set <code>ROUTABLE_PREFIXES=262,240</code> (DE, SE, &hellip;) alongside
+<code>REMOTE_PREFIX=222</code> in the Zone's <code>[TRUNK_x]</code> section
+facing IT 222. Now <code>2629</code> matches the routable <code>262</code>, so
+the Zone forwards it to IT 222, which &mdash; in the international mesh with a
+<code>262</code> trunk to DE &mdash; relays it onward; the return audio comes
+back via peer interest.</p>
+
+<p>A multi-trunk Zone (inside the national mesh) must name each foreign prefix
+explicitly &mdash; there is no automatic propagation. A region trunked
+<em>only</em> to IT 222 (a single-uplink leaf) can instead use
+<code>ROUTABLE_PREFIXES=*</code>, a default route reaching any TG via its one
+uplink; do <strong>not</strong> use <code>*</code> on a multi-trunk Zone (it
+logs a startup warning and is ambiguous about which leg to use).</p>
+
+<div class="note">
+  <span class="label">Cluster TGs are for unowned TGs, not cross-mesh routing</span>
+  Gateway prefix routing handles foreign-to-regional reach automatically
+  as long as IT 222 has a <code>[TRUNK_x]</code> section pointing at the
+  regional reflector — regional TGs do not need to be listed in
+  <code>CLUSTER_TGS</code>. <code>CLUSTER_TGS</code> is the right tool
+  for TGs that <strong>cannot</strong> be resolved by prefix because no
+  reflector owns them: TG <code>91</code> for worldwide chat
+  (international domain), or <code>112</code> for nationwide broadcast
+  inside a country (national domain). Configure those on every reflector
+  that should join the broadcast.
+</div>
+
+<h3>Variant: sub-trunk star</h3>
+
+<p>The national side does not have to be a full mesh. IT 222 can delegate
+sub-prefixes of its own <code>222</code> over ordinary trunks to Zones that
+each trunk <em>only</em> to IT 222. The Zones still <strong>own</strong> their
+prefixes — that is the whole difference from a satellite, which owns nothing
+and inherits its parent's identity (§3). A Zone may own more than one prefix:
+<code>REMOTE_PREFIX</code> is a comma-separated list, so one reflector can
+serve Lombardia and Emilia-Romagna together.</p>
+
+<figure>
+  <img src="03_subtrunk_star.svg" alt="Sub-trunk star under IT 222">
+  <figcaption>Diagram 3 — IT 222 owns <code>222</code> and delegates
+  <code>2221</code> and <code>2222,2224</code> to Zone reflectors over ordinary
+  trunks. A star, not a full mesh: each Zone holds exactly one uplink, so its
+  uplink section carries <code>ROUTABLE_PREFIXES=*</code>.</figcaption>
+</figure>
+
+<p>Each Zone has exactly one trunk, so its uplink takes the
+single-uplink-leaf <code>ROUTABLE_PREFIXES=*</code> described above rather than
+an explicit prefix list.</p>
+
+<h4>Delegation, not collision</h4>
+<p>IT 222 owns <code>222</code>; Z1 owns <code>2221</code>. TG <code>22213</code>
+matches both, and longest-prefix-match hands it to Z1. That overlap is the
+mechanism, not a hazard.</p>
+
+<table>
+  <tr><th>TG</th><th>Longest match</th><th>Owner</th></tr>
+  <tr><td><code>22213</code></td><td><code>2221</code></td><td>IT-Z1</td></tr>
+  <tr><td><code>22241</code></td><td><code>2224</code></td><td>IT-Z2/Z4</td></tr>
+  <tr><td><code>22299</code></td><td><code>222</code></td><td>IT 222</td></tr>
+  <tr><td><code>2629</code></td><td>none locally → <code>*</code> route</td>
+      <td>up to IT 222, then DE</td></tr>
+</table>
+
+<p>A <strong>Z1 client keying <code>2629</code></strong> (DE) reaches Germany
+because <code>2629</code> matches nothing Z1 owns and the uplink's
+<code>*</code> makes IT 222 the default route: Z1 → IT 222 → DE. Inbound, an SE
+client keying <code>22241</code> lands on IT 222, whose gateway prefix routing
+bridges it down to IT-Z2/Z4 exactly as in the full-mesh case.</p>
+
+<h4>A Zone mixes local-only and mesh-reachable TGs</h4>
+<p>Owning <code>2222,2224</code> does not mean every TG on that reflector is
+routable. Three kinds coexist.</p>
+
+<table>
+  <tr><th>TG on IT-Z2/Z4</th><th>Config</th><th>Reach</th></tr>
+  <tr><td><code>22241</code></td>
+      <td>owned outright (under <code>2224</code>)</td>
+      <td>routed across the mesh by prefix</td></tr>
+  <tr><td><code>40</code></td>
+      <td>nothing — matches no prefix</td>
+      <td><strong>effectively local</strong>: no reflector owns it</td></tr>
+  <tr><td><code>8</code></td>
+      <td><code>LOCAL_ALIASES=8:2222008</code></td>
+      <td>dialed as <code>8</code> locally, <code>2222008</code> on the mesh</td></tr>
+</table>
+
+<p><code>40</code> stays a private Zone talk group and <code>8</code> is the
+club TG operators keep dialing by its short number while the mesh routes it as
+<code>2222008</code> under the Zone's own <code>2222</code> prefix. Mind the
+cost of the <code>*</code> route, though: it matches everything no longer
+prefix claims, so <code>40</code> is still forwarded up the uplink, and IT 222
+discards it only on arrival — it matches neither IT's <code>LOCAL_PREFIX</code>
+nor the Zone's <code>REMOTE_PREFIX</code>. Nobody hears it, but it crosses the
+wire. With an explicit <code>ROUTABLE_PREFIXES=262,240</code> it would never
+egress at all.</p>
+
+<h4>Full mesh or star?</h4>
+<table>
+  <tr><th>Property</th><th>Full mesh</th><th>Sub-trunk star</th></tr>
+  <tr><td>TCP connections per Zone</td>
+      <td>M − 1 within the national mesh (Zones + IT 222)</td>
+      <td>1 (to IT 222)</td></tr>
+  <tr><td>NAT story</td>
+      <td>Zones need inbound reachability from other Zones + IT 222</td>
+      <td>Zone dials out; only IT 222 needs an inbound port</td></tr>
+  <tr><td>IT 222 outage</td>
+      <td>Zones keep talking to each other; international reach is lost</td>
+      <td>Zones are isolated from each other and from abroad</td></tr>
+  <tr><td>Zone-to-Zone audio</td>
+      <td>direct, one hop</td>
+      <td>two hops, relayed by IT 222</td></tr>
+  <tr><td>Foreign → regional TG reach</td>
+      <td>gateway prefix routing on IT 222 (<code>shouldRelayInbound</code>)</td>
+      <td>same</td></tr>
+  <tr><td>Reaching international TGs from a Zone</td>
+      <td>list foreign prefixes in <code>ROUTABLE_PREFIXES</code> per leg</td>
+      <td><code>ROUTABLE_PREFIXES=*</code> on the one uplink</td></tr>
+  <tr><td>Prefix advertised upstream</td>
+      <td>only <code>222</code> (Zones not visible to SE/DE)</td>
+      <td>only <code>222</code></td></tr>
+</table>
+
+<p>Either way, foreign reflectors carry no Italian internal prefix table — the
+country presents one face upstream (<code>222</code>) — and IT 222 is a single
+point of failure for international reach into or out of Italy, unless it is run
+as a twin pair (§4).</p>
+</section>
+
+<section>
+<h2>3. Satellite under a regional reflector</h2>
+
+<p>Hybrid layout: keep the §2 two-domain structure (intl mesh + national mesh
+joined at IT 222), and let one Zone host its own satellite reflector. The
+Zone itself is <em>not</em> a satellite — it wears two hats: trunk peer in
+the national mesh, parent to its own satellite. A satellite is a
+<strong>leaf</strong>: it owns no prefix, accepts no children of its own, and
+inherits the parent's identity. That is why a Zone (which owns
+<code>2222</code>) is sub-trunked in §2 rather than made a satellite. Two
+motivations apply, often together:</p>
+
+<ul>
+  <li><strong>NAT traversal.</strong> The downstream site (e.g. a Milano
+      club, MI) only needs one outbound TCP connection to Z2. No
+      port-forwarding, no public IP — useful when the sub-group's site
+      sits behind carrier-grade NAT or a firewall the Zone admin doesn't
+      control.</li>
+  <li><strong>Administrative delegation.</strong> The Zone admin (e.g. of
+      IT-Z2 / Lombardia) lets a sub-group bring up their own reflector
+      with their own user accounts and passwords, <em>without</em>
+      sharing Z2's <code>[USERS]</code> / <code>[PASSWORDS]</code>
+      database. Z2 admin holds Z2's user DB and the
+      <code>[SATELLITE] SECRET</code> that MI presents to attach; MI
+      admin holds MI's own <code>[USERS]</code> /
+      <code>[PASSWORDS]</code> — only MI's V2 clients authenticate
+      against it. Audio federates over the satellite link while
+      authentication state stays separated on each side.</li>
+</ul>
+
+<div class="note">
+  <span class="label">Trust model</span>
+  Pin each satellite to its own credential with a
+  <code>SECRET_&lt;id&gt;</code> entry in <code>[SATELLITE]</code>, matched
+  against the satellite's <code>SATELLITE_ID</code>. Per-id wins, and an HMAC
+  mismatch on a pinned id is rejected with no fallback to the shared
+  <code>SECRET</code> — so a leaked secret from one club cannot impersonate
+  another. Use it whenever more than one operator runs satellites under the
+  same parent. A single shared <code>SECRET</code> is fine for a one-operator
+  deployment.
+</div>
+
+<figure>
+  <img src="04_hybrid.svg" alt="Hybrid layout — two-domain trunk + a satellite under Z2">
+  <figcaption>Diagram 4 — International + national trunk mesh joined at IT 222,
+  plus a satellite reflector (MI club, NAT'd) hanging off Z2 over port :5303.
+  Z2 simultaneously serves as national trunk peer and satellite parent.</figcaption>
+</figure>
+
+<h3>Flow</h3>
+<ul>
+  <li><strong>MI client keys <code>22221</code>:</strong> MI mirrors up to
+      Z2 (Lombardia). Z2 owns <code>2222</code> — plays locally, fans on the
+      trunk side to interested peers in the <em>national</em> mesh
+      (IT 222 / Z1 / Z3 / Z4 if they've shown interest), and skips MI on the
+      satellite side because MI is the source. Z2 does not trunk-forward to
+      SE/DE — it has no trunks to them.</li>
+  <li><strong>SE client keys <code>22221</code>:</strong> SE only knows
+      <code>222 → IT</code>. SE→IT 222 over the trunk. IT 222 isn't the
+      owner of <code>2222</code>, but its gateway-routing rule
+      (<code>shouldRelayInbound</code> finds a <code>2222</code> route in
+      IT's trunk table) bridges the frame to Z2. Z2 plays locally and
+      mirrors down to MI through the satellite link (filter <code>2222*</code>
+      matches). The return leg works symmetrically through
+      <code>isPeerInterestedTG</code>.</li>
+  <li><strong>MI client keys <code>22241</code></strong> (Emilia-Romagna,
+      owned by Z4): MI→Z2 (satellite up). Z2 isn't the owner — its trunk-side
+      forwarding sees <code>2224</code> and trunk-sends to Z4. Z4 plays
+      locally and fans to interested peers, including Z2 <em>only if</em>
+      Z2 has previously PTT'd on <code>22241</code>. Consequence: the first
+      MI→<code>22241</code> PTT works outbound but won't get return audio
+      until Z2 is registered as interested at Z4. The MI→Z2→Z4 PTT itself
+      registers Z2's interest, so for the next ~10 min audio from any other
+      client on <code>22241</code> flows Z4→Z2→MI.</li>
+</ul>
+
+<div class="note">
+  <span class="label">Filter caveat</span>
+  A restrictive <code>SATELLITE_FILTER</code> like <code>2222*</code> prevents
+  MI from reaching anything outside Lombardia: filter is bidirectional, so MI
+  suppresses non-<code>2222*</code> outbound and Z2 drops non-<code>2222*</code>
+  forwards going down. The MI→<code>22241</code> example above only works if
+  the filter is broadened to <code>222*</code> (or unset). Use a tight filter
+  only when the satellite truly is single-purpose (e.g. a regional repeater
+  that should never hear other Zones' traffic). Mind the syntax: entries are
+  <strong>exact</strong> unless they end in <code>*</code> —
+  <code>2222</code> matches only literal TG <code>2222</code>, while
+  <code>2222*</code> matches everything under Lombardia. The shared TG-filter
+  syntax is exact <code>26200</code>, prefix <code>24*</code>, range
+  <code>2427-2438</code>, comma-separated.
+</div>
+</section>
+
+<section class="topology">
+<h2>4. HA twin pair</h2>
+
+<p>A <strong>twin</strong> is a purpose-built link type for running two
+reflector instances as a redundant pair. Both nodes declare the
+<em>same</em> <code>LOCAL_PREFIX</code>, mirror their full <code>TGHandler</code>
+state to each other over a <code>[TWIN]</code> link, and present as a single
+logical reflector to the rest of the world. SvxLink nodes list both endpoints
+in their <code>HOSTS</code> setting for transparent failover.</p>
+
+<figure>
+  <img src="05_twin_pair.svg" alt="HA twin pair — DE as a twin">
+  <figcaption>Diagram 5 — DE is operated as a twin pair (DE-A and DE-B both
+  own <code>LOCAL_PREFIX=262</code>). External peers (IT, SE) hold one
+  <code>[TRUNK_x]</code> section with <code>PAIRED=1</code> and
+  <code>HOST=de-a,de-b</code>; each frame goes to one socket at a time,
+  sticky with failover. The bold purple <code>[TWIN]</code> link mirrors
+  full state symmetrically.</figcaption>
+</figure>
+
+<h3>What's different from trunk and satellite</h3>
+<table>
+  <tr><th>Property</th><th>Trunk</th><th>Satellite</th><th>Twin</th></tr>
+  <tr><td>Directionality</td><td>symmetric</td>
+      <td>one-way bias (parent→satellite)</td><td>symmetric</td></tr>
+  <tr><td>Prefix ownership</td>
+      <td>distinct per node</td><td>n/a</td>
+      <td><strong>identical</strong> on both nodes</td></tr>
+  <tr><td>Filtering</td>
+      <td><code>isSharedTG</code> / <code>isOwnedTG</code></td>
+      <td>none (all TGs)</td>
+      <td>none (full mirror inside the pair)</td></tr>
+  <tr><td>Peers per section</td>
+      <td>1</td><td>many satellites per parent</td>
+      <td><strong>exactly 1</strong> (strictly pairwise)</td></tr>
+  <tr><td>External trunk ownership</td>
+      <td>each node holds its own</td><td>parent-only</td>
+      <td>both hold; external peer picks one socket per frame</td></tr>
+  <tr><td>Heartbeat cadence (TX = send interval, RX = silence timeout)</td>
+      <td>10 s / 15 s</td><td>10 s / 15 s</td>
+      <td><strong>2 s / 5 s</strong> (LAN-close)</td></tr>
+</table>
+
+<h3>Flow</h3>
+<ul>
+  <li><strong>SvxLink client connects to DE-B</strong> and PTTs on a German
+      TG. DE-B handles the audio locally (it owns <code>262</code>) and
+      mirrors state to DE-A over the twin link so DE-A's clients can't
+      grab the same TG simultaneously. External trunks: DE-B forwards on
+      its own external trunks to interested peers; DE-A does <em>not</em>
+      re-forward (otherwise external peers would see duplicates).</li>
+  <li><strong>An IT client keys a German TG</strong>: IT's
+      <code>[TRUNK_DE]</code> section has <code>PAIRED=1</code> and
+      <code>HOST=de-a,de-b</code>, so IT holds two TCP sockets but sends
+      each frame to its sticky-selected endpoint (say DE-A). DE-A delivers
+      locally, mirrors to DE-B over the twin link so DE-B's local clients
+      hear it too, and DE-B suppresses re-forwarding back out.</li>
+  <li><strong>DE-A goes down</strong>: IT's TCP socket to DE-A drops; IT's
+      next frame fails over to DE-B with no holdoff. DE-B keeps serving;
+      its clients are unaffected. When DE-A recovers, the twin handshake
+      resyncs <code>TGHandler</code> state.</li>
+  <li><strong>Twin link itself goes down (split-brain)</strong>: both
+      twins keep operating fully and independently. Cross-pair talker
+      arbitration is lost for the duration — duplicate-talker artifacts
+      may appear if clients on both nodes PTT the same TG simultaneously.
+      External trunks remain healthy in both directions.</li>
+</ul>
+
+<div class="note">
+  <span class="label">Cross-twin arbitration</span>
+  When both twins' clients PTT the same TG at the same instant, the
+  priority-nonce in <code>MsgPeerHello</code> tie-breaks (lower wins,
+  loser yields). This is the same mechanism trunks use for cross-site
+  arbitration — reused intra-pair. Two new message types
+  (<code>MsgTwinExtTalkerStart</code> / <code>Stop</code>, types 123/124)
+  carry external-trunk talker state across the twin so the partner won't
+  let local clients key a TG that's already busy on an external peer.
+</div>
+
+<h3>When to use it</h3>
+<p>Twin layout is the right answer when you need <strong>HA failover for
+clients</strong> on a single reflector site — for instance, two physical
+servers on the same LAN, both with public IPs, fronting a cluster of
+SvxLink nodes. It composes with everything else: the twin pair can
+simultaneously be a country gateway in the international mesh (§1), a
+member of a national trunk topology (§2), or the parent of a club
+satellite (§3). Don't reach for twins just to share traffic across two boxes — that's
+what plain trunks are for.</p>
+</section>
+
+<section class="topology">
+<h2>Overlay: local aliases</h2>
+
+<p>Not a topology shape but an overlay that composes with all five: a way to
+make an existing <strong>short local TG</strong> reachable from the mesh
+without renumbering it on the clients. Routing follows the number, so a TG
+matching no configured prefix has no owner and stays <strong>local-only</strong>
+&mdash; yet a club or legacy talk group like <code>8</code> is exactly the kind
+of number operators have in their muscle memory and their node configs.
+<code>LOCAL_ALIASES</code> (in <code>[GLOBAL]</code>) resolves the tension by
+<strong>re-homing</strong> the short TG under one of the reflector's own
+prefixes, giving it a globally-unique number while local users keep dialing the
+short one &mdash; e.g. <code>LOCAL_ALIASES=8:2220008</code> alongside
+<code>LOCAL_PREFIX=222</code> on IT 222.</p>
+
+<figure>
+  <img src="06_local_alias.svg" alt="Local alias — short TG 8 re-homed as 2220008">
+  <figcaption>Diagram 6 &mdash; IT 222 re-homes its local TG <code>8</code> as
+  <code>2220008</code>. Foreign peers route the long number by ordinary
+  longest-prefix-match; IT translates at the trunk boundary and its own nodes
+  keep selecting <code>8</code>.</figcaption>
+</figure>
+
+<h3>Syntax and direction</h3>
+<p>Comma-separated entries of the form <code>localTG:aliasTG[/dir]</code>,
+where <code>dir</code> is <code>in</code> or <code>out</code>; omitted means
+two-way.</p>
+<ul>
+  <li><strong>two-way</strong> (<code>8:2220008</code>): local talk on
+      <code>8</code> is exported to the mesh as <code>2220008</code>, and mesh
+      traffic on <code>2220008</code> is delivered to local clients as
+      <code>8</code>.</li>
+  <li><strong><code>/out</code></strong> (<code>90:2220090/out</code>):
+      publish-only &mdash; local talk is exported, inbound mesh traffic is not
+      folded back onto the short number.</li>
+  <li><strong><code>/in</code></strong> (<code>91:2220091/in</code>):
+      listen-only &mdash; mesh traffic is delivered locally, the short number
+      is never exported.</li>
+</ul>
+
+<h3>Ownership rule</h3>
+<p><code>aliasTG</code> must fall under one of <em>this</em> reflector's
+<code>LOCAL_PREFIX</code> values, checked with the same longest-prefix match
+used for TG ownership everywhere else. An entry whose <code>aliasTG</code> is
+not owned is rejected at config load &mdash; logged as an error and skipped,
+while the reflector still starts and the remaining valid entries take effect.
+A reflector can therefore never alias its way onto a number another peer owns:
+you may only re-home a TG into space you already own.</p>
+
+<h3>Routing on the long number, delivery on the short one</h3>
+<p>The alias is a translation applied at the <strong>trunk boundary</strong>,
+not a rename. Prefix routing, owner-relay fanout and peer-interest bookkeeping
+all run on the long number, because that is the identity the rest of the mesh
+matches prefixes against. Local delivery and talker arbitration run on the
+short number, because that is what local clients selected. Everything on the
+local side of the boundary &mdash; clients and satellites alike &mdash; sees
+<code>8</code>; everything across a trunk sees <code>2220008</code>. A client
+that dials the long number directly is folded onto the short one the moment it
+selects or monitors the TG (<em>rewrite-on-select</em>), so the two are always
+one conversation locally.</p>
+
+<h3>Flow</h3>
+<ul>
+  <li>An <strong>SE client keys <code>2220008</code></strong>: SE's prefix
+      table matches <code>222 &rarr; IT</code>, so the audio crosses the trunk
+      to IT exactly like any other owned TG. IT translates at the boundary and
+      delivers it to its local nodes on TG <code>8</code>.</li>
+  <li>An <strong>IT client keys <code>8</code></strong>: IT exports it to the
+      mesh as <code>2220008</code>, reaching peers that have registered
+      interest in that TG. Locally it is an ordinary TG <code>8</code>
+      transmission.</li>
+</ul>
+
+<p>Because <code>aliasTG</code> must be owned locally, each reflector aliases
+into its <em>own</em> prefix space: in §2 an Italian Zone re-homes its club TGs
+under its Zone prefix (<code>2222…</code> for Z2) while IT 222 re-homes under
+<code>222…</code>. In a twin pair (§4), give <strong>both</strong> twins
+identical <code>LOCAL_ALIASES</code> &mdash; each twin independently applies the
+translation on its own trunk sections.</p>
+
+<div class="note">
+  <span class="label">Aliases are not cluster TGs</span>
+  <code>CLUSTER_TGS</code> broadcasts an <em>unowned</em> TG to every peer
+  regardless of prefix. <code>LOCAL_ALIASES</code> does the opposite: it pulls
+  an unowned short number <em>into</em> your owned prefix space so that ordinary
+  longest-prefix-match routing takes over. Reach for an alias when the TG
+  belongs to you; reach for a cluster TG when it belongs to everyone.
+</div>
+</section>
+
+<section>
+<h2>Picking a topology</h2>
+
+<table>
+  <tr><th>Constraint</th><th>Use</th></tr>
+  <tr><td>Just one reflector per country, no regional split needed</td>
+      <td>International only (§1)</td></tr>
+  <tr><td>Each Zone has a public IP; want regional autonomy and resilience to gateway outage</td>
+      <td>National trunk topology, full mesh (§2)</td></tr>
+  <tr><td>Zones own their prefixes but sit behind NAT, or you want one simple uplink per Zone instead of a full mesh</td>
+      <td>National trunk topology, sub-trunk star (§2)</td></tr>
+  <tr><td>§2 layout overall, plus a sub-group needs its own reflector — either NAT'd or with its own user DB to delegate (<code>[USERS]</code>/<code>[PASSWORDS]</code> separated)</td>
+      <td>Satellite under a regional reflector (§3)</td></tr>
+  <tr><td>HA failover for SvxLink clients on a single site (two boxes, same LAN)</td>
+      <td>Twin pair (§4) — composes with §1–§3</td></tr>
+  <tr><td>An existing short local TG (e.g. <code>8</code>) must stay dialable locally but become reachable across the mesh</td>
+      <td><code>LOCAL_ALIASES</code> overlay — composes with §1–§4</td></tr>
+</table>
+
+<p>The shapes compose: the international layer (§1) is always present, and §2
+and §3 are ways to fan out <em>inside</em> a country. §4 is orthogonal — any
+single reflector role above can be played by a twin pair instead, and the
+<code>LOCAL_ALIASES</code> overlay applies to any of them.</p>
+
+<h3>Appendix: MCC ranges and cluster-TG numbering</h3>
+
+<p>Talk-group prefixes align with the ITU-T E.212 Mobile Country Code
+(MCC) plan, so prefix ownership is self-documenting and globally
+consistent.</p>
+
+<table>
+  <tr><th>Range</th><th>Use</th></tr>
+  <tr><td><code>0</code></td>
+      <td><strong>Special.</strong> TG <code>0</code> is a protocol
+      sentinel meaning "no TG selected." V2 clients authenticate with
+      <code>tg=0</code> and then select a real TG with
+      <code>MsgSelectTG</code>. Audio is never sent or received on
+      TG <code>0</code>.</td></tr>
+  <tr><td><code>001</code>, other <code>0xx</code></td>
+      <td>ITU test networks. Not assigned to any country.</td></tr>
+  <tr><td><code>1xx</code></td>
+      <td>Reserved by ITU. Not assigned to any country.</td></tr>
+  <tr><td><code>2xx</code></td>
+      <td><strong>Europe.</strong> Lowest country MCC:
+      <code>202</code> Greece. (<code>200</code>, <code>201</code> are
+      unassigned.)</td></tr>
+  <tr><td><code>3xx</code></td><td>North America (incl. Greenland, Caribbean)</td></tr>
+  <tr><td><code>4xx</code></td><td>Asia, Middle East</td></tr>
+  <tr><td><code>5xx</code></td><td>Oceania</td></tr>
+  <tr><td><code>6xx</code></td><td>Africa</td></tr>
+  <tr><td><code>7xx</code></td><td>South &amp; Central America</td></tr>
+  <tr><td><code>8xx</code>, <code>9xx</code></td>
+      <td>Reserved / non-country use (rare assignments)</td></tr>
+</table>
+
+<p><strong>Safe cluster-TG ranges: <code>100–199</code> and
+<code>800–999</code>.</strong> Pick cluster TGs (the kind that bypass
+prefix ownership — see §2) from these ranges:</p>
+
+<ul>
+  <li>The <code>1xx</code> block is reserved by ITU and contains no
+      country MCC.</li>
+  <li>The <code>8xx</code> and <code>9xx</code> blocks are reserved /
+      non-country (rare assignments only).</li>
+</ul>
+
+<p>A cluster TG drawn from either range cannot collide with any current
+or future country prefix (countries live entirely in
+<code>200</code>–<code>799</code>). Combined that's roughly 300 available
+numbers — more than enough for worldwide, nationwide, and any thematic
+broadcast TGs you want to define.</p>
+
+<p>Avoid <code>200</code>–<code>799</code> (country prefix collisions)
+and the <code>0xx</code>/<code>1</code>–<code>99</code> ranges (the
+latter are technically safe but unconventional for DMR/SvxLink TG
+numbering — short numbers are rare in practice). The well-known TG
+<code>91</code> (worldwide chat) is a pre-existing convention that
+predates this recommendation; new cluster-TG assignments should follow
+the <code>100–199</code> / <code>800–999</code> rule.</p>
+
+<h3 style="page-break-after: avoid;">Properties that hold across all variants</h3>
+<ul style="page-break-inside: avoid;">
+  <li>Longest-prefix-match decides the owner of any given TG.</li>
+  <li>Routing follows the <strong>number, not its length</strong>: a TG goes to
+      the owner of its longest matching prefix that exists in the mesh (e.g.
+      <code>22210</code>&rarr;<code>222</code>, <code>26201</code>&rarr;<code>262</code>,
+      when those country prefixes are owned). A TG matching <strong>no</strong>
+      configured prefix has no owner and stays <strong>local-only</strong> —
+      it relays among the originating reflector's own nodes but is never trunked
+      — unless a link carries <code>ROUTABLE_PREFIXES=*</code>, whose default
+      route forwards it to the uplink, where the peer drops it as unowned.
+      Local TG numbering is the operator's choice; only numbers under the agreed
+      prefix scheme are reachable across the mesh. A local-only number can be
+      given mesh reach without renumbering the clients, via the
+      <code>LOCAL_ALIASES</code> overlay.</li>
+  <li>Aliases translate at the trunk boundary only: the mesh routes the long
+      owned number, local clients and satellites see the short one.</li>
+  <li>Trunk relay is single-hop. Satellite mirror is independent of that
+      rule.</li>
+  <li>Owner fanout is gated by <strong>peer interest</strong> with a
+      10-minute idle window. Interest is registered when a peer first
+      transmits on a TG, or proactively when it advertises a selected /
+      monitored TG via <code>MsgPeerTgInterest</code>.</li>
+  <li>Source-side exclusion in the owner's fanout prevents echo loops.</li>
+  <li><code>SATELLITE_FILTER</code> is bidirectional and advertised to the
+      parent.</li>
+  <li>Talker arbitration uses the random 32-bit nonce exchanged in
+      <code>MsgPeerHello</code> — lower wins. The loser defers and blocks
+      local clients from interrupting.</li>
+</ul>
+</section>
+
+</body>
+</html>

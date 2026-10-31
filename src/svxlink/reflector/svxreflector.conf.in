@@ -1,0 +1,274 @@
+###################################################################
+#
+# Configuration file for the SvxReflector SvxLink conference node
+#
+###################################################################
+
+[GLOBAL]
+#CFG_DIR=svxreflector.d
+TIMESTAMP_FORMAT="%c"
+LISTEN_PORT=5300
+#SQL_TIMEOUT=600
+#SQL_TIMEOUT_BLOCKTIME=60
+#CODECS=OPUS
+TG_FOR_V1_CLIENTS=999
+#LOCAL_PREFIX=1
+# LOCAL_ALIASES — re-home short local TGs under an owned prefix so they are
+# reachable internationally by their globally-unique number.  Comma-separated
+# entries "localTG:aliasTG[/dir]"; dir is "in" or "out" (omitted = two-way).
+# The aliasTG MUST fall under a LOCAL_PREFIX or the entry is rejected at load.
+# Local users keep dialing localTG; the trunk mesh sees aliasTG.
+#LOCAL_ALIASES=8:2620008,9:2620009/out,4001:2620400/in
+#CLUSTER_TGS=222,2221,91
+#RANDOM_QSY_RANGE=12399:100
+#HTTP_SRV_PORT=8080
+COMMAND_PTY=/dev/shm/reflector_ctrl
+#ACCEPT_CALLSIGN="[A-Z0-9][A-Z]{0,2}\\d[A-Z0-9]{0,3}[A-Z](?:-[A-Z0-9]{1,3})?"
+#REJECT_CALLSIGN=""
+#ACCEPT_CERT_EMAIL="\\w+(?:[-._+]\\w+)*@\\w+(?:\\.\\w+)*"
+#CERT_PKI_DIR=pki/
+#CERT_CA_BUNDLE=ca-bundle.crt
+#CERT_CA_KEYS_DIR=private/
+#CERT_CA_PENDING_CSRS_DIR=pending_csrs/
+#CERT_CA_CSRS_DIR=csrs/
+#CERT_CA_CERTS_DIR=certs/
+CERT_CA_HOOK=@SVX_SHARE_INSTALL_DIR@/ca-hook.py
+
+[ROOT_CA]
+#KEYFILE=svxreflector_root_ca.key
+#CRTFILE=svxreflector_root_ca.crt
+#COMMON_NAME=SvxReflector Root CA
+#ORG_UNIT=SvxLink
+#ORG=MyOrg
+#LOCALITY=MyTown
+#STATE=StateOrProvince
+#COUNTRY=XX
+#EMAIL_ADDRESS=sysop@svxlink.example.org
+
+[ISSUING_CA]
+#KEYFILE=svxreflector_issuing_ca.key
+#CSRFILE=svxreflector_issuing_ca.csr
+#CRTFILE=svxreflector_issuing_ca.crt
+#COMMON_NAME=SvxReflector Issuing CA
+#ORG_UNIT=SvxLink
+#ORG=MyOrg
+#LOCALITY=MyTown
+#STATE=StateOrProvince
+#COUNTRY=XX
+#EMAIL_ADDRESS=sysop@svxlink.example.org
+
+[SERVER_CERT]
+#KEYFILE=svxreflector.key
+#CSRFILE=svxreflector.csr
+#CRTFILE=svxreflector.crt
+#COMMON_NAME=svxreflector.example.org
+#ORG_UNIT=SvxLink
+#ORG=MyOrg
+#LOCALITY=MyTown
+#STATE=StateOrProvince
+#COUNTRY=XX
+#SUBJECT_ALT_NAME=DNS:public-hostname.example.org,IP:172.17.1.42
+#EMAIL_ADDRESS=sysop@svxlink.example.org
+
+[USERS]
+#SM0ABC-1=MyNodes
+#SM0ABC-2=MyNodes
+#SM3XYZ=SM3XYZ
+
+[PASSWORDS]
+#MyNodes="Change this key now!"
+#SM3XYZ="A strong password"
+
+#[TG#9999]
+#AUTO_QSY_AFTER=300
+#ALLOW=S[A-M]\\\\d.*|LA8PV
+#ALLOW_MONITOR=S[A-M]3.*
+#SHOW_ACTIVITY=0
+
+# Trunk links to peer SvxReflector instances (prefix-based TG routing).
+#
+# Each reflector owns all TGs whose decimal representation starts with
+# LOCAL_PREFIX. For example, LOCAL_PREFIX=1 means this reflector is
+# authoritative for TGs 1, 10, 100, 1000, 12345, etc.
+#
+# Add LOCAL_PREFIX to the [GLOBAL] section, then add one [TRUNK_x] section
+# per peer. REMOTE_PREFIX declares which TG prefix the peer owns.
+#
+# IMPORTANT: The [TRUNK_x] section name must be identical on both sides.
+# Both sysops must agree on a shared name and secret for each link.
+#
+# Example for a two-reflector mesh:
+#   Reflector A: LOCAL_PREFIX=1, [TRUNK_AB] with REMOTE_PREFIX=2
+#   Reflector B: LOCAL_PREFIX=2, [TRUNK_AB] with REMOTE_PREFIX=1
+#
+#LOCAL_PREFIX=1
+#TRUNK_LISTEN_PORT=5302
+# Per-subsystem logging levels. Comma-separated <subsystem>=<level> pairs.
+# '*' sets the default for subsystems not explicitly listed.
+# Levels: trace, debug, info, warn, error, off.
+# Subsystems: trunk, satellite, twin, client, mqtt, redis, core.
+#
+# Absent or empty => *=info.
+# Live-reloadable via the command PTY:
+#     echo "LOG trunk=debug" > /dev/shm/reflector_ctrl
+#     echo "LOG SHOW"        > /dev/shm/reflector_ctrl
+#     echo "LOG RESET"       > /dev/shm/reflector_ctrl
+#
+# TRUNK_DEBUG is obsolete; use LOG=trunk=debug instead.
+#LOG=*=info
+
+#[TRUNK_AB]
+#HOST=reflector-b.example.com
+#PORT=5302
+#SECRET=change_this_shared_secret
+#REMOTE_PREFIX=2
+# Optional PEER_ID — name advertised to the peer in the trunk hello
+# (defaults to section name). The peer uses it as the MQTT topic
+# component for this link, so set it to a stable, broker-friendly name.
+#PEER_ID=reflector-a
+# Optional per-trunk TG filters (syntax: exact "26200", prefix "24*",
+# range "2427-2438", comma-separated). These gate audio/talker traffic AND
+# trim the peer's node roster shown under /status.trunks[<section>].nodes
+# (and its MQTT/Redis mirror), so a filtered TG never pollutes the roster.
+#BLACKLIST_TGS=666,777*       # never carried in either direction on this link
+#ALLOW_TGS=24*,2624123        # if set, ONLY these TGs are exchanged
+# Optional bidirectional TG remap (peer_tg:local_tg, comma-separated).
+# Mapped TGs bypass the prefix routing check on this link.
+#TG_MAP=1:2624123,2:2624124
+# Optional additional prefixes routable VIA this peer, on top of REMOTE_PREFIX.
+# Use on a regional leaf's single uplink as "*" (default route to the parent),
+# or on a backbone trunk as explicit prefixes to enable multi-hop transit to a
+# sibling reflector (e.g. reach 263 via the 262 peer). "*" is never relayed
+# between trunks (loop-safe) and only affects this node's local clients;
+# explicit prefixes transit toward the owner and must be declared on each hop.
+# A more specific routable prefix intentionally delegates that sub-range to the
+# declared peer (longest-prefix-match honors it); point it at the reflector
+# that actually owns those TGs. BLACKLIST_TGS still vetoes regardless.
+#ROUTABLE_PREFIXES=263        # backbone transit toward 263
+#ROUTABLE_PREFIXES=*          # regional leaf default route via this uplink
+
+###############################################################################
+# Twin (HA-pair) link — see docs/TWIN_PROTOCOL.md
+###############################################################################
+# Uncomment to pair this reflector with a partner that shares its LOCAL_PREFIX.
+# Both reflectors declare an IDENTICAL LOCAL_PREFIX and a [TWIN] section
+# pointing at each other.  Clients can connect to either node and external
+# trunk peers see the pair as a single logical peer (with PAIRED=1 on their
+# side — see below).
+#
+#[TWIN]
+#HOST=ref2.example.de
+#PORT=5304
+#SECRET=shared_twin_secret
+
+# Twin server listen port (default 5304)
+#TWIN_LISTEN_PORT=5304
+
+###############################################################################
+# Paired external trunk — consume a remote HA-pair as a single logical peer
+###############################################################################
+# When the remote side is a twin pair (two reflectors with the same
+# LOCAL_PREFIX linked via [TWIN]), set PAIRED=1 and list both their hosts
+# in HOST=.  This reflector opens TCP connections to both, accepts inbound
+# from both, and uses sticky per-transmission selection with instant failover.
+#
+#[TRUNK_IT_DE]
+#HOST=ref1.example.de,ref2.example.de
+#PORT=5302
+#SECRET=shared_trunk_secret
+#REMOTE_PREFIX=262
+#PAIRED=1
+
+# --- Satellite reflectors ---
+# A satellite is a lightweight reflector that connects to a parent
+# reflector instead of joining the trunk mesh. Clients connect to the
+# satellite normally; it relays everything to the parent.
+#
+# Parent side: accept inbound satellite connections.
+#
+# Authentication uses HMAC over a shared secret. There are two ways to
+# configure secrets:
+#
+#   1. A single fallback secret (SECRET=) used by every satellite.
+#   2. Per-id secrets (SECRET_<id>=) where <id> matches the satellite's
+#      SATELLITE_ID value. Allowed id characters: [A-Za-z0-9-]+.
+#
+# Lookup rule when a satellite connects:
+#   - If SECRET_<id>= is set for the satellite's id, verify against
+#     that value. Mismatch rejects the connection (no fallback).
+#   - Otherwise, fall back to SECRET= if set.
+#   - Otherwise, reject.
+#
+# Keeping SECRET= alongside SECRET_<id>= is backward-compatible:
+# existing satellites with no per-id entry continue to use the default.
+#
+#[SATELLITE]
+#LISTEN_PORT=5303
+#SECRET=fallback_satellite_secret
+#SECRET_alpha=secret_for_alpha
+#SECRET_bravo-east=secret_for_bravo_east
+#
+# Satellite side: set these in [GLOBAL] instead of LOCAL_PREFIX/TRUNK_x
+#SATELLITE_OF=reflector-01.example.com
+#SATELLITE_PORT=5303
+#SATELLITE_SECRET=change_this_satellite_secret
+#SATELLITE_ID=my-satellite
+# Optional TG filter — restricts which TGs this satellite cares about.
+# Applied in both directions: the satellite skips sending local events for
+# non-matching TGs, and advertises the filter to the parent via
+# MsgPeerFilter (type 122) so the parent skips forwarding them back.
+# Syntax: exact "26200", prefix "24*", range "2427-2438", comma-separated.
+# Empty or absent = no filtering (all TGs pass in both directions).
+#SATELLITE_FILTER=24*,262*
+
+#
+# MQTT publishing. Optional — omit this section to disable.
+# Publishes real-time events (talker, client, trunk state) and periodic
+# full status to an external MQTT broker.
+#
+# All fields except TLS and STATUS_INTERVAL are required when this
+# section is present. TOPIC_PREFIX has no default — set it to a unique
+# identifier for this reflector (e.g. svxreflector/myreflector).
+#
+#[MQTT]
+#HOST=mqtt.example.com
+#PORT=1883
+#USERNAME=reflector
+#PASSWORD=secret
+#TOPIC_PREFIX=svxreflector/myreflector
+# Optional MQTT_NAME — appended as a path component, so topics become
+# <TOPIC_PREFIX>/<MQTT_NAME>/... — useful when several reflectors share
+# the same TOPIC_PREFIX. Leave unset to keep topics flat.
+#MQTT_NAME=reflector-01
+# Periodic full-status publish interval in milliseconds (default 30000).
+# The full snapshot is a bootstrap/drift-correction tool for new MQTT
+# subscribers — per-event topics already deliver every change live.
+# Lower this only if you have a small mesh and a consumer that depends
+# on near-real-time full snapshots; at hundreds of nodes the retained
+# payload is hundreds of KB and republishing it once per second is
+# expensive on broker bandwidth and reflector CPU.
+#STATUS_INTERVAL=30000
+#TLS_ENABLED=0
+#TLS_CA_CERT=/path/to/ca.crt
+#TLS_CLIENT_CERT=/path/to/client.crt
+#TLS_CLIENT_KEY=/path/to/client.key
+
+#
+# Redis-backed config store. Optional — omit this section to use the
+# config-file-only behavior. When this section is present, [USERS],
+# [PASSWORDS], CLUSTER_TGS, and per-trunk BLACKLIST_TGS / ALLOW_TGS /
+# TG_MAP / mute lists are read from Redis instead of this file. Use
+# `svxreflector --import-conf-to-redis` once to migrate existing entries.
+#
+#[REDIS]
+#HOST=127.0.0.1
+#PORT=6379
+#PASSWORD=
+#DB=0
+#KEY_PREFIX=
+#UNIX_SOCKET=             # if set, takes precedence over HOST/PORT
+#TLS_ENABLED=0
+#TLS_CA_CERT=
+#TLS_CLIENT_CERT=
+#TLS_CLIENT_KEY=
+
