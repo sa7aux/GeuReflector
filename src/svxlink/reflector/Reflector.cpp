@@ -1435,7 +1435,8 @@ void Reflector::udpDatagramReceived(const IpAddress& addr, uint16_t port,
             if (mx != nullptr)
             {
               mx->writeOpus("c:" + std::to_string(client->clientId()),
-                            msg.audioData(), /*local=*/true);
+                            msg.audioData(), /*local=*/true,
+                            client->callsign());
             }
           }
           else
@@ -1626,6 +1627,7 @@ TGMixer* Reflector::getOrCreateMixer(uint32_t tg)
   }
   TGMixer* mx = new TGMixer(tg, *m_cfg);
   mx->mixReady.connect(mem_fun(*this, &Reflector::onMixReady));
+  mx->sourceActivity.connect(mem_fun(*this, &Reflector::onSourceActivity));
   m_tg_mixers[tg] = mx;
   return mx;
 } /* Reflector::getOrCreateMixer */
@@ -1725,113 +1727,169 @@ void Reflector::removeFromAllMixers(ReflectorClient* client)
 } /* Reflector::removeFromAllMixers */
 
 
-void Reflector::onTalkerUpdated(uint32_t tg, ReflectorClient* old_talker,
-                                ReflectorClient *new_talker)
+void Reflector::emitTalkerStop(uint32_t tg, const std::string& callsign,
+                               ReflectorClient* talker)
 {
-  if (old_talker != 0)
+  geulog::info("client", callsign, ": Talker stop on TG #", tg);
+  if (talker != nullptr)
   {
-    geulog::info("client", old_talker->callsign(), ": Talker stop on TG #", tg);
-    old_talker->updateIsTalker();
-    broadcastMsg(MsgTalkerStop(tg, old_talker->callsign()),
+    talker->updateIsTalker();
+  }
+  broadcastMsg(MsgTalkerStop(tg, callsign),
+      ReflectorClient::mkAndFilter(
+        ge_v2_client_filter,
+        ReflectorClient::mkOrFilter(
+          ReflectorClient::TgFilter(tg),
+          ReflectorClient::TgMonitorFilter(tg))));
+  if (tg == tgForV1Clients())
+  {
+    broadcastMsg(MsgTalkerStopV1(callsign), v1_client_filter);
+  }
+  broadcastUdpMsg(MsgUdpFlushSamples(),
         ReflectorClient::mkAndFilter(
-          ge_v2_client_filter,
           ReflectorClient::mkOrFilter(
             ReflectorClient::TgFilter(tg),
-            ReflectorClient::TgMonitorFilter(tg))));
-    if (tg == tgForV1Clients())
-    {
-      broadcastMsg(MsgTalkerStopV1(old_talker->callsign()), v1_client_filter);
-    }
-    broadcastUdpMsg(MsgUdpFlushSamples(),
-          ReflectorClient::mkAndFilter(
-            ReflectorClient::mkOrFilter(
-              ReflectorClient::TgFilter(tg),
+            ReflectorClient::mkAndFilter(
+              ReflectorClient::TgMonitorFilter(tg),
               ReflectorClient::mkAndFilter(
-                ReflectorClient::TgMonitorFilter(tg),
-                ReflectorClient::mkAndFilter(
-                  ReflectorClient::PassiveObserverFilter(),
-                  ReflectorClient::EarliestMonitorTalkerFilter(tg)))),
-            ReflectorClient::ExceptFilter(old_talker)));
-    if (m_mqtt != nullptr)
-    {
-      m_mqtt->onTalkerStop(tg, old_talker->callsign(), false);
-    }
-    if (m_redis != nullptr)
-    {
-      m_redis->clearLiveTalker(tg);
-    }
-  }
-  if (new_talker != 0)
+                ReflectorClient::PassiveObserverFilter(),
+                ReflectorClient::EarliestMonitorTalkerFilter(tg)))),
+          ReflectorClient::ExceptFilter(talker)));
+  if (m_mqtt != nullptr)
   {
-    geulog::info("client", new_talker->callsign(), ": Talker start on TG #", tg);
-    new_talker->updateIsTalker();
-    broadcastMsg(MsgTalkerStart(tg, new_talker->callsign()),
-        ReflectorClient::mkAndFilter(
-          ge_v2_client_filter,
-          ReflectorClient::mkOrFilter(
-            ReflectorClient::TgFilter(tg),
-            ReflectorClient::TgMonitorFilter(tg))));
-    if (tg == tgForV1Clients())
-    {
-      broadcastMsg(MsgTalkerStartV1(new_talker->callsign()), v1_client_filter);
-    }
-    if (m_mqtt != nullptr)
-    {
-      m_mqtt->onTalkerStart(tg, new_talker->callsign(), false);
-    }
-    if (m_redis != nullptr)
-    {
-      m_redis->pushLiveTalker(tg, new_talker->callsign(), "local");
-    }
+    m_mqtt->onTalkerStop(tg, callsign, false);
   }
-
-  // In satellite mode, forward to parent instead of trunk peers
-  if (m_is_satellite && m_satellite_client != nullptr)
+  if (m_redis != nullptr)
   {
-    if (new_talker != nullptr)
-    {
-      m_satellite_client->onLocalTalkerStart(tg, new_talker->callsign());
-    }
-    else
-    {
-      m_satellite_client->onLocalTalkerStop(tg);
-    }
+    m_redis->clearLiveTalker(tg);
+  }
+  // Notify mesh peers about the local talker stop (same as half-duplex).
+  if (m_is_satellite && (m_satellite_client != nullptr))
+  {
+    m_satellite_client->onLocalTalkerStop(tg);
   }
   else
   {
-    // Notify trunk peers about local talker changes.
     for (auto* link : m_trunk_links)
     {
-      if (new_talker != nullptr)
-      {
-        link->onLocalTalkerStart(tg, new_talker->callsign());
-      }
-      else
-      {
-        link->onLocalTalkerStop(tg);
-      }
+      link->onLocalTalkerStop(tg);
     }
-    // Notify connected satellites
     for (auto& kv : m_satellite_con_map)
     {
-      if (new_talker != nullptr)
-      {
-        kv.second->onParentTalkerStart(tg, new_talker->callsign());
-      }
-      else
-      {
-        kv.second->onParentTalkerStop(tg);
-      }
+      kv.second->onParentTalkerStop(tg);
     }
-    // Notify twin partner about local talker changes.
     if (m_twin_link != nullptr)
     {
-      std::string callsign = (new_talker != nullptr) ? new_talker->callsign()
-                                                     : "";
+      m_twin_link->onLocalTalkerUpdated(tg, "");
+    }
+  }
+} /* Reflector::emitTalkerStop */
+
+
+void Reflector::emitTalkerStart(uint32_t tg, const std::string& callsign,
+                                ReflectorClient* talker)
+{
+  geulog::info("client", callsign, ": Talker start on TG #", tg);
+  if (talker != nullptr)
+  {
+    talker->updateIsTalker();
+  }
+  broadcastMsg(MsgTalkerStart(tg, callsign),
+      ReflectorClient::mkAndFilter(
+        ge_v2_client_filter,
+        ReflectorClient::mkOrFilter(
+          ReflectorClient::TgFilter(tg),
+          ReflectorClient::TgMonitorFilter(tg))));
+  if (tg == tgForV1Clients())
+  {
+    broadcastMsg(MsgTalkerStartV1(callsign), v1_client_filter);
+  }
+  if (m_mqtt != nullptr)
+  {
+    m_mqtt->onTalkerStart(tg, callsign, false);
+  }
+  if (m_redis != nullptr)
+  {
+    m_redis->pushLiveTalker(tg, callsign, "local");
+  }
+  // Notify mesh peers about the local talker start (same as half-duplex).
+  if (m_is_satellite && (m_satellite_client != nullptr))
+  {
+    m_satellite_client->onLocalTalkerStart(tg, callsign);
+  }
+  else
+  {
+    for (auto* link : m_trunk_links)
+    {
+      link->onLocalTalkerStart(tg, callsign);
+    }
+    for (auto& kv : m_satellite_con_map)
+    {
+      kv.second->onParentTalkerStart(tg, callsign);
+    }
+    if (m_twin_link != nullptr)
+    {
       m_twin_link->onLocalTalkerUpdated(tg, callsign);
     }
   }
+} /* Reflector::emitTalkerStart */
+
+
+void Reflector::onTalkerUpdated(uint32_t tg, ReflectorClient* old_talker,
+                                ReflectorClient *new_talker)
+{
+  // Half-duplex single-talker path: one stop and/or one start. These two
+  // are never both set at the same time, so the mesh fanout matches the
+  // original behaviour exactly.
+  if (old_talker != 0)
+  {
+    emitTalkerStop(tg, old_talker->callsign(), old_talker);
+  }
+  if (new_talker != 0)
+  {
+    emitTalkerStart(tg, new_talker->callsign(), new_talker);
+  }
 } /* Reflector::onTalkerUpdated */
+
+
+void Reflector::onSourceActivity(uint32_t tg, const std::string& id,
+                                 const std::string& callsign, bool active)
+{
+  // Full-duplex per-talker path. Only local sources ("c:<clientId>") emit
+  // talker-start/stop here; mesh sources are signalled to peers via the
+  // onLocalTalkerStart/Stop fanout inside emitTalkerStart/Stop instead.
+  if (id.rfind("c:", 0) != 0)
+  {
+    return;
+  }
+  // Best-effort: resolve the client object for updateIsTalker() and the
+  // flush ExceptFilter. If the client has already gone, the message is
+  // still emitted with the stored callsign.
+  ReflectorClient* client = nullptr;
+  try
+  {
+    ReflectorClient::ClientId cid =
+        static_cast<ReflectorClient::ClientId>(std::stoul(id.substr(2)));
+    const TGHandler::ClientSet& clients =
+        TGHandler::instance()->clientsForTG(tg);
+    for (ReflectorClient* c : clients)
+    {
+      if (c->clientId() == cid) { client = c; break; }
+    }
+  }
+  catch (...)
+  {
+    client = nullptr;
+  }
+  if (active)
+  {
+    emitTalkerStart(tg, callsign, client);
+  }
+  else
+  {
+    emitTalkerStop(tg, callsign, client);
+  }
+} /* Reflector::onSourceActivity */
 
 
 void Reflector::httpRequestReceived(Async::HttpServerConnection *con,

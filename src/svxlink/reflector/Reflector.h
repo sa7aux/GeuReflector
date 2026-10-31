@@ -600,6 +600,32 @@ class Reflector : public sigc::trackable
     void removeFromAllMixers(ReflectorClient* client);
     void onTalkerUpdated(uint32_t tg, ReflectorClient* old_talker,
                          ReflectorClient *new_talker);
+    /**
+     * @brief   Emit a talker-start exactly as half-duplex does.
+     *
+     * Broadcasts MsgTalkerStart (+V1), updates MQTT/Redis and forwards the
+     * talker-start to trunk/satellite/twin peers. Shared by the half-duplex
+     * single-talker path and the full-duplex per-talker path so both behave
+     * identically and stay backward compatible. @p talker may be null if the
+     * client object is no longer available (message still carries callsign).
+     */
+    void emitTalkerStart(uint32_t tg, const std::string& callsign,
+                         ReflectorClient* talker);
+    /**
+     * @brief   Emit a talker-stop exactly as half-duplex does (incl. flush).
+     */
+    void emitTalkerStop(uint32_t tg, const std::string& callsign,
+                        ReflectorClient* talker);
+    /**
+     * @brief   Full-duplex per-source talker activity from a TGMixer.
+     *
+     * Maps a local ("c:") source to its client and emits the same
+     * talker-start/stop as half-duplex. Mesh sources are signalled to peers
+     * via the normal onLocalTalkerStart/Stop fanout, so they are ignored
+     * here.
+     */
+    void onSourceActivity(uint32_t tg, const std::string& id,
+                          const std::string& callsign, bool active);
     void httpRequestReceived(Async::HttpServerConnection *con,
                              Async::HttpServerConnection::Request& req);
     void httpClientConnected(Async::HttpServerConnection *con);

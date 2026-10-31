@@ -196,7 +196,8 @@ TGMixer::~TGMixer(void)
 } /* TGMixer::~TGMixer */
 
 
-void TGMixer::addSource(const std::string& id, bool local)
+void TGMixer::addSource(const std::string& id, bool local,
+                        const std::string& callsign)
 {
   if (m_sources.find(id) != m_sources.end())
   {
@@ -205,6 +206,7 @@ void TGMixer::addSource(const std::string& id, bool local)
 
   Source* src = new Source;
   src->is_local = local;
+  src->callsign = callsign;
   // Ring cap: prebuffer plus a generous margin so bursts are absorbed.
   size_t cap = m_prebuf_size + m_frame_size * 8;
   if (cap < m_frame_size * 4)
@@ -242,6 +244,13 @@ void TGMixer::removeSource(const std::string& id)
   {
     return;
   }
+  // If the source was mid-transmission, announce its stop so talker-stop is
+  // sent (e.g. a client disconnecting while keyed up).
+  if (it->second->announced_active)
+  {
+    it->second->announced_active = false;
+    sourceActivity(m_tg, id, it->second->callsign, false);
+  }
   destroySource(it->second);
   m_sources.erase(it);
   if (m_sources.empty())
@@ -258,15 +267,20 @@ bool TGMixer::hasSource(const std::string& id) const
 
 
 void TGMixer::writeOpus(const std::string& id,
-                        const std::vector<uint8_t>& opus, bool local)
+                        const std::vector<uint8_t>& opus, bool local,
+                        const std::string& callsign)
 {
   auto it = m_sources.find(id);
   if (it == m_sources.end())
   {
-    addSource(id, local);
+    addSource(id, local, callsign);
     it = m_sources.find(id);
   }
   Source* src = it->second;
+  if (!callsign.empty())
+  {
+    src->callsign = callsign; // keep the latest known callsign
+  }
   if ((src->decoder != nullptr) && !opus.empty())
   {
     // AudioDecoder::writeEncodedSamples takes a non-const buffer pointer.
@@ -416,6 +430,31 @@ void TGMixer::onTick(Async::Timer*)
     {
       frame_of[src] = pcm; // keep own pcm for mix-minus-self
     }
+  }
+
+  // Detect per-source start/stop transitions (debounced by the hangover)
+  // and announce them so the reflector can send MsgTalkerStart/Stop exactly
+  // like half-duplex. Collected first, emitted after, so slots cannot
+  // disturb the iteration.
+  {
+    std::vector<std::pair<std::string, std::string>> starts, stops;
+    for (auto& kv : m_sources)
+    {
+      Source* src = kv.second;
+      bool now_active = (src->active_hangover > 0);
+      if (now_active && !src->announced_active)
+      {
+        src->announced_active = true;
+        starts.emplace_back(kv.first, src->callsign);
+      }
+      else if (!now_active && src->announced_active)
+      {
+        src->announced_active = false;
+        stops.emplace_back(kv.first, src->callsign);
+      }
+    }
+    for (auto& p : stops)  { sourceActivity(m_tg, p.first, p.second, false); }
+    for (auto& p : starts) { sourceActivity(m_tg, p.first, p.second, true); }
   }
 
   // Prune sources that have been idle past the timeout. Safe at any time:

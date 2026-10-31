@@ -122,7 +122,8 @@ class TGMixer : public sigc::trackable
      *                stream (trunk/satellite/twin). Only local sources are
      *                summed into MixResult::local_mix.
      */
-    void addSource(const std::string& id, bool local = true);
+    void addSource(const std::string& id, bool local = true,
+                   const std::string& callsign = "");
 
     /**
      * @brief   Remove a source (e.g. client/link disconnected)
@@ -148,7 +149,7 @@ class TGMixer : public sigc::trackable
      *                (used only if the source must be auto-registered)
      */
     void writeOpus(const std::string& id, const std::vector<uint8_t>& opus,
-                   bool local = true);
+                   bool local = true, const std::string& callsign = "");
 
     /**
      * @brief   The talk group id this mixer serves
@@ -161,6 +162,19 @@ class TGMixer : public sigc::trackable
      * Not emitted for a frame in which no source produced any audio.
      */
     sigc::signal<void(const MixResult&)> mixReady;
+
+    /**
+     * @brief   Emitted when a source starts or stops producing audio.
+     * @param   tg       This mixer's talk group
+     * @param   id       The source id (e.g. "c:<clientId>")
+     * @param   callsign The source's callsign (empty if unknown)
+     * @param   active   true on idle->active, false on active->idle
+     *
+     * Debounced by the activity hangover so it does not flap between
+     * packets. Used to drive MsgTalkerStart/Stop exactly like half-duplex.
+     */
+    sigc::signal<void(uint32_t, const std::string&, const std::string&, bool)>
+        sourceActivity;
 
   private:
     static const unsigned SAMPLE_RATE = INTERNAL_SAMPLE_RATE;
@@ -175,6 +189,8 @@ class TGMixer : public sigc::trackable
       std::deque<float>     ring;              // jitter buffer (PCM)
       bool                  prebuffering = true;
       bool                  is_local = true;   // local client vs mesh source
+      std::string           callsign;          // for talker-start/stop
+      bool                  announced_active = false; // start/stop debounce
       unsigned              active_hangover = 0; // frames since last audio
       unsigned              idle_frames = 0;   // consecutive fully-idle frames
       std::vector<uint8_t>  cur_out;           // encoder output this frame
