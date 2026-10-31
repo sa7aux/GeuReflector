@@ -11,6 +11,12 @@ LISTEN_PORT=5300
 #SQL_TIMEOUT=600
 #SQL_TIMEOUT_BLOCKTIME=60
 #CODECS=OPUS
+# DUPLEX_MODE — global default duplex mode for all talk groups.
+#   half = legacy single-talker behaviour (one talker per TG at a time).
+#   full = full-duplex per-TG audio mixing (several nodes may talk at once
+#          and are mixed together, like a telephone conference).
+# Overridable per talk group in a [TG#<n>] section.  Default: half.
+#DUPLEX_MODE=half
 TG_FOR_V1_CLIENTS=999
 #LOCAL_PREFIX=1
 # LOCAL_ALIASES — re-home short local TGs under an owned prefix so they are
@@ -84,6 +90,8 @@ CERT_CA_HOOK=@SVX_SHARE_INSTALL_DIR@/ca-hook.py
 #ALLOW=S[A-M]\\\\d.*|LA8PV
 #ALLOW_MONITOR=S[A-M]3.*
 #SHOW_ACTIVITY=0
+# Override the global DUPLEX_MODE for this talk group (half/full).
+#DUPLEX_MODE=full
 
 # Trunk links to peer SvxReflector instances (prefix-based TG routing).
 #

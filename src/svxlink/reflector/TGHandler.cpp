@@ -33,6 +33,7 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 #include <iostream>
 #include <cassert>
 #include <algorithm>
+#include <cctype>
 #include <sstream>
 #include <regex>
 #include <Log.h>
@@ -502,6 +503,23 @@ bool TGHandler::isRestricted(uint32_t tg) const
   std::string allow;
   return m_cfg->getValue(ss.str(), "ALLOW", allow);
 } /* TGHandler::isRestricted */
+
+
+bool TGHandler::fullDuplexForTG(uint32_t tg) const
+{
+    // Per-TG value overrides the global default; default is half-duplex so
+    // the legacy single-talker behaviour is unchanged when unconfigured.
+  std::ostringstream ss;
+  ss << "TG#" << tg;
+  std::string mode;
+  if (!m_cfg->getValue(ss.str(), "DUPLEX_MODE", mode) || mode.empty())
+  {
+    m_cfg->getValue("GLOBAL", "DUPLEX_MODE", mode);
+  }
+  std::transform(mode.begin(), mode.end(), mode.begin(),
+                 [](unsigned char c){ return std::tolower(c); });
+  return mode == "full";
+} /* TGHandler::fullDuplexForTG */
 
 
 /****************************************************************************
