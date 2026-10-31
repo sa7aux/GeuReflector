@@ -17,6 +17,14 @@ LISTEN_PORT=5300
 #          and are mixed together, like a telephone conference).
 # Overridable per talk group in a [TG#<n>] section.  Default: half.
 #DUPLEX_MODE=half
+# Full-duplex mixer tunables (only used when DUPLEX_MODE=full). Each is
+# overridable per talk group in a [TG#<n>] section.
+#   MIX_FRAME_MS    audio frame length in ms            (default 20,  5-60)
+#   MIX_JITTER_MS   per-source jitter buffer depth in ms (default 60, 0-500)
+#   MIX_MAX_TALKERS max simultaneously mixed talkers     (default 4,  1-32)
+#MIX_FRAME_MS=20
+#MIX_JITTER_MS=60
+#MIX_MAX_TALKERS=4
 TG_FOR_V1_CLIENTS=999
 #LOCAL_PREFIX=1
 # LOCAL_ALIASES — re-home short local TGs under an owned prefix so they are

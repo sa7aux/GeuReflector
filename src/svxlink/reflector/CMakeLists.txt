@@ -53,7 +53,7 @@ set(LIBS asynccpp asyncaudio asynccore svxmisc ${LIBS})
 # Build the executable
 set(REFLECTOR_SOURCES
   svxreflector.cpp Reflector.cpp ReflectorClient.cpp TGHandler.cpp TrunkLink.cpp
-  TwinLink.cpp
+  TwinLink.cpp TGMixer.cpp
   SatelliteLink.cpp SatelliteClient.cpp
 )
 if(WITH_MQTT)
