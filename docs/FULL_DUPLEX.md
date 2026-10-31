@@ -108,11 +108,12 @@ Half and full coexist at two levels:
   single-talker relay; a `full` TG mixes. They run side by side with no
   interference (e.g. TG 91 half, TG 240 full on the same server).
 - **Across a trunk/mesh:** a TG can even be `half` on one reflector and
-  `full` on another and still exchange audio, **because full-duplex sends the
-  same talker-start/stop as half**. A full reflector's local talker-start
-  opens the half peer's talker gate (so the half side relays the full side's
-  mix to its clients), and a half reflector's talker-start lets the full side
-  feed that audio into its mixer.
+  `full` on another and still exchange audio, **because full-duplex signals a
+  single collapsed talker-start/stop toward the mesh, exactly as half does**
+  (see the talker-start/stop caveat below). A full reflector's conference
+  talker-start opens the half peer's talker gate (so the half side relays the
+  full side's mix to its clients), and a half reflector's talker-start lets
+  the full side feed that audio into its mixer.
 
   The one limit: the half side is still single-talker *toward the mesh*, so it
   cannot itself mix two simultaneous remote talkers. For true multi-talker
@@ -141,13 +142,20 @@ Read these before enabling full-duplex in production.
   a multi-hop path is *dropped* audio between hops, never howling.
 - **Monitors are not routed in full mode.** Only nodes that have *selected*
   the TG receive the mix; passive monitors/observers do not (yet).
-- **Talker-start/stop behave exactly like half-duplex.** Full mode emits the
-  same `MsgTalkerStart`/`MsgTalkerStop` (and V1 variants, flush, MQTT/Redis,
-  and the trunk/satellite/twin talker fan-out) that half-duplex does — one
-  per talker, so several may be active at once. This keeps dashboards,
-  TCL events and TG auto-activation working and is backward compatible (no
-  new message types). It is also what lets a half and a full reflector
-  interoperate over a trunk (see below).
+- **Talker-start/stop are 100% backward compatible over the mesh.** Full mode
+  emits the same `MsgTalkerStart`/`MsgTalkerStop` (and V1 variants, flush,
+  MQTT/Redis) as half-duplex — no new message types. Toward **local clients**
+  each talker still gets its own start/stop, so several may show at once
+  (dashboards, TCL events and TG auto-activation keep working). Toward the
+  **mesh** (trunk / satellite / twin) the whole local conference is collapsed
+  to a **single** talker-start when the first local talker keys up and a
+  **single** talker-stop when the last one drops — because the mesh only ever
+  carries this reflector's single mixed `local_mix` and a peer ingests the
+  trunk as **one** source. A peer therefore sees exactly one talker, never a
+  storm of overlapping starts/stops, so an **old half-duplex peer behaves
+  identically to receiving a single remote talker and never flaps**. This
+  collapse is what lets a half and a full reflector interoperate over a trunk
+  (see below). The counting is per-TG and self-heals on disconnect.
 - **Latency adds up.** End-to-end delay is the server mixer jitter buffer
   (`MIX_JITTER_MS`) plus the client's own `JITTER_BUFFER_DELAY`. In full mode,
   keep the client's `JITTER_BUFFER_DELAY` low to avoid stacking both.

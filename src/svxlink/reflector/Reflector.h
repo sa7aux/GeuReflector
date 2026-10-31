@@ -532,6 +532,12 @@ class Reflector : public sigc::trackable
     // DUPLEX_MODE is "full"). Created lazily on first audio, destroyed when
     // their last source goes away.
     std::map<uint32_t, TGMixer*>                         m_tg_mixers;
+    // Per-TG count of currently-active LOCAL talkers as signalled onto the
+    // mesh for full-duplex TGs. Used to collapse a multi-talker conference
+    // into a single mesh talker-start/stop (backward-compatible simplex
+    // signalling toward trunk/satellite/twin peers). See
+    // meshConferenceTalkerStart()/Stop().
+    std::map<uint32_t, int>                              m_fdx_mesh_talkers;
 
     // Twin HA-pair support
     TwinLink*                                            m_twin_link = nullptr;
@@ -639,6 +645,30 @@ class Reflector : public sigc::trackable
      */
     void onSourceActivity(uint32_t tg, const std::string& id,
                           const std::string& callsign, bool active);
+    /**
+     * @brief   Fan a talker-start/stop out to the mesh (trunk/sat/twin).
+     *
+     * This is the exact mesh-fanout block that half-duplex uses. Factored
+     * out so the full-duplex path can collapse several simultaneous local
+     * talkers into a single-talker signal toward the mesh.
+     */
+    void meshTalkerStart(uint32_t tg, const std::string& callsign);
+    void meshTalkerStop(uint32_t tg);
+    /**
+     * @brief   Full-duplex: collapse the local conference to ONE mesh talker.
+     *
+     * A full-duplex TG may have several local talkers at once, but on the
+     * mesh wire only this reflector's single mixed sub-mix (local_mix) is
+     * sent, and a remote peer ingests the whole trunk as ONE source. So the
+     * mesh must see exactly one talker-start when the local conference first
+     * becomes active and exactly one talker-stop when it goes fully idle -
+     * never per-talker starts/stops. That is byte-for-byte what an old
+     * half-duplex peer expects (single talker), so trunking a full-duplex TG
+     * to half-duplex software stays 100% backward compatible and never
+     * flaps. Counts active local talkers per TG via m_fdx_mesh_talkers.
+     */
+    void meshConferenceTalkerStart(uint32_t tg, const std::string& callsign);
+    void meshConferenceTalkerStop(uint32_t tg);
     void httpRequestReceived(Async::HttpServerConnection *con,
                              Async::HttpServerConnection::Request& req);
     void httpClientConnected(Async::HttpServerConnection *con);

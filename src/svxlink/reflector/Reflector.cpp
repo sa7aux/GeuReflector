@@ -1773,7 +1773,22 @@ void Reflector::emitTalkerStop(uint32_t tg, const std::string& callsign,
   {
     m_redis->clearLiveTalker(tg);
   }
-  // Notify mesh peers about the local talker stop (same as half-duplex).
+  // Notify mesh peers about the local talker stop. See emitTalkerStart():
+  // full-duplex collapses the conference to one mesh talker-stop, half-duplex
+  // keeps the original per-talker fanout unchanged.
+  if (TGHandler::instance()->fullDuplexForTG(tg))
+  {
+    meshConferenceTalkerStop(tg);
+  }
+  else
+  {
+    meshTalkerStop(tg);
+  }
+} /* Reflector::emitTalkerStop */
+
+
+void Reflector::meshTalkerStop(uint32_t tg)
+{
   if (m_is_satellite && (m_satellite_client != nullptr))
   {
     m_satellite_client->onLocalTalkerStop(tg);
@@ -1793,7 +1808,29 @@ void Reflector::emitTalkerStop(uint32_t tg, const std::string& callsign,
       m_twin_link->onLocalTalkerUpdated(tg, "");
     }
   }
-} /* Reflector::emitTalkerStop */
+} /* Reflector::meshTalkerStop */
+
+
+void Reflector::meshConferenceTalkerStop(uint32_t tg)
+{
+  auto it = m_fdx_mesh_talkers.find(tg);
+  if ((it == m_fdx_mesh_talkers.end()) || (it->second <= 0))
+  {
+    // No conference talker-start outstanding; nothing to stop. Keeps the
+    // mesh in sync even if starts/stops ever arrive unbalanced.
+    if (it != m_fdx_mesh_talkers.end())
+    {
+      m_fdx_mesh_talkers.erase(it);
+    }
+    return;
+  }
+  if (--it->second <= 0)
+  {
+    // Last local talker gone -> one mesh talker-stop for the conference.
+    m_fdx_mesh_talkers.erase(it);
+    meshTalkerStop(tg);
+  }
+} /* Reflector::meshConferenceTalkerStop */
 
 
 void Reflector::emitTalkerStart(uint32_t tg, const std::string& callsign,
@@ -1822,7 +1859,25 @@ void Reflector::emitTalkerStart(uint32_t tg, const std::string& callsign,
   {
     m_redis->pushLiveTalker(tg, callsign, "local");
   }
-  // Notify mesh peers about the local talker start (same as half-duplex).
+  // Notify mesh peers about the local talker start. A full-duplex TG may
+  // have several simultaneous local talkers, but the mesh only ever carries
+  // this reflector's single mixed local_mix and a peer ingests the trunk as
+  // ONE source, so the mesh must see exactly one talker-start/stop for the
+  // whole local conference (100% backward compatible with half-duplex
+  // peers). Half-duplex TGs keep the original per-talker fanout unchanged.
+  if (TGHandler::instance()->fullDuplexForTG(tg))
+  {
+    meshConferenceTalkerStart(tg, callsign);
+  }
+  else
+  {
+    meshTalkerStart(tg, callsign);
+  }
+} /* Reflector::emitTalkerStart */
+
+
+void Reflector::meshTalkerStart(uint32_t tg, const std::string& callsign)
+{
   if (m_is_satellite && (m_satellite_client != nullptr))
   {
     m_satellite_client->onLocalTalkerStart(tg, callsign);
@@ -1842,7 +1897,21 @@ void Reflector::emitTalkerStart(uint32_t tg, const std::string& callsign,
       m_twin_link->onLocalTalkerUpdated(tg, callsign);
     }
   }
-} /* Reflector::emitTalkerStart */
+} /* Reflector::meshTalkerStart */
+
+
+void Reflector::meshConferenceTalkerStart(uint32_t tg,
+                                          const std::string& callsign)
+{
+  int& n = m_fdx_mesh_talkers[tg];
+  if (n <= 0)
+  {
+    n = 0;
+    // First local talker in the conference -> one mesh talker-start.
+    meshTalkerStart(tg, callsign);
+  }
+  ++n;
+} /* Reflector::meshConferenceTalkerStart */
 
 
 void Reflector::onTalkerUpdated(uint32_t tg, ReflectorClient* old_talker,
