@@ -549,6 +549,17 @@ class Reflector : public sigc::trackable
                                void *buf, int count);
     void udpDatagramReceived(const Async::IpAddress& addr, uint16_t port,
                              void* aad, void *buf, int count);
+    /**
+     * @brief   Legacy half-duplex audio relay: single-talker gate + fanout.
+     *
+     * Contains the original single-talker forwarding logic (first-talker
+     * wins per TG; only the current talker's audio is relayed, raw Opus,
+     * to local clients, trunk links, satellites and the twin). Used for
+     * talk groups whose resolved DUPLEX_MODE is "half". Behaviour is
+     * unchanged from before the full-duplex work.
+     */
+    void relaySingleTalkerAudio(ReflectorClient* client, uint32_t tg,
+                                const std::vector<uint8_t>& audio_data);
     void onTalkerUpdated(uint32_t tg, ReflectorClient* old_talker,
                          ReflectorClient *new_talker);
     void httpRequestReceived(Async::HttpServerConnection *con,

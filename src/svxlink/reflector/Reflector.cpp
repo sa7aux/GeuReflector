@@ -1417,45 +1417,17 @@ void Reflector::udpDatagramReceived(const IpAddress& addr, uint16_t port,
         uint32_t tg = TGHandler::instance()->TGForClient(client);
         if (!msg.audioData().empty() && (tg > 0))
         {
-          ReflectorClient* talker = TGHandler::instance()->talkerForTG(tg);
-          if ((talker == 0) &&
-              !TGHandler::instance()->hasTrunkTalker(tg))
+          if (TGHandler::instance()->fullDuplexForTG(tg))
           {
-            TGHandler::instance()->setTalkerForTG(tg, client);
-            talker = TGHandler::instance()->talkerForTG(tg);
+            // STEG 2: full-duplex per-TG mixing is not yet wired into the
+            // audio path. Until TGMixer lands we fall back to the legacy
+            // single-talker relay, so enabling DUPLEX_MODE=full does not
+            // change behaviour yet.
+            relaySingleTalkerAudio(client, tg, msg.audioData());
           }
-          if (talker == client)
+          else
           {
-            TGHandler::instance()->setTalkerForTG(tg, client);
-            broadcastUdpMsg(msg,
-                ReflectorClient::mkAndFilter(
-                  ReflectorClient::ExceptFilter(client),
-                  ReflectorClient::mkOrFilter(
-                    ReflectorClient::TgFilter(tg),
-                    ReflectorClient::mkAndFilter(
-                      ReflectorClient::TgMonitorFilter(tg),
-                      ReflectorClient::mkAndFilter(
-                        ReflectorClient::PassiveObserverFilter(),
-                        ReflectorClient::EarliestMonitorTalkerFilter(tg))))));
-            if (m_is_satellite && m_satellite_client != nullptr)
-            {
-              m_satellite_client->onLocalAudio(tg, msg.audioData());
-            }
-            else
-            {
-              for (auto* link : m_trunk_links)
-              {
-                link->onLocalAudio(tg, msg.audioData());
-              }
-              for (auto& kv : m_satellite_con_map)
-              {
-                kv.second->onParentAudio(tg, msg.audioData());
-              }
-              if (m_twin_link != nullptr)
-              {
-                m_twin_link->onLocalAudio(tg, msg.audioData());
-              }
-            }
+            relaySingleTalkerAudio(client, tg, msg.audioData());
           }
         }
       }
@@ -1579,6 +1551,53 @@ void Reflector::udpDatagramReceived(const IpAddress& addr, uint16_t port,
       break;
   }
 } /* Reflector::udpDatagramReceived */
+
+
+void Reflector::relaySingleTalkerAudio(ReflectorClient* client, uint32_t tg,
+                                       const std::vector<uint8_t>& audio_data)
+{
+  ReflectorClient* talker = TGHandler::instance()->talkerForTG(tg);
+  if ((talker == 0) &&
+      !TGHandler::instance()->hasTrunkTalker(tg))
+  {
+    TGHandler::instance()->setTalkerForTG(tg, client);
+    talker = TGHandler::instance()->talkerForTG(tg);
+  }
+  if (talker == client)
+  {
+    TGHandler::instance()->setTalkerForTG(tg, client);
+    MsgUdpAudio msg(audio_data);
+    broadcastUdpMsg(msg,
+        ReflectorClient::mkAndFilter(
+          ReflectorClient::ExceptFilter(client),
+          ReflectorClient::mkOrFilter(
+            ReflectorClient::TgFilter(tg),
+            ReflectorClient::mkAndFilter(
+              ReflectorClient::TgMonitorFilter(tg),
+              ReflectorClient::mkAndFilter(
+                ReflectorClient::PassiveObserverFilter(),
+                ReflectorClient::EarliestMonitorTalkerFilter(tg))))));
+    if (m_is_satellite && m_satellite_client != nullptr)
+    {
+      m_satellite_client->onLocalAudio(tg, audio_data);
+    }
+    else
+    {
+      for (auto* link : m_trunk_links)
+      {
+        link->onLocalAudio(tg, audio_data);
+      }
+      for (auto& kv : m_satellite_con_map)
+      {
+        kv.second->onParentAudio(tg, audio_data);
+      }
+      if (m_twin_link != nullptr)
+      {
+        m_twin_link->onLocalAudio(tg, audio_data);
+      }
+    }
+  }
+} /* Reflector::relaySingleTalkerAudio */
 
 
 void Reflector::onTalkerUpdated(uint32_t tg, ReflectorClient* old_talker,
