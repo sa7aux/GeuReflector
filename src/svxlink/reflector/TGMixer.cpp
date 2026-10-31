@@ -136,6 +136,9 @@ TGMixer::TGMixer(uint32_t tg, const Async::Config& cfg)
   m_frame_ms    = cfgUnsigned(cfg, tg, "MIX_FRAME_MS",    20,  5,  60);
   m_jitter_ms   = cfgUnsigned(cfg, tg, "MIX_JITTER_MS",   60,  0, 500);
   m_max_talkers = cfgUnsigned(cfg, tg, "MIX_MAX_TALKERS",  4,  1,  32);
+  unsigned src_timeout_ms =
+                  cfgUnsigned(cfg, tg, "MIX_SOURCE_TIMEOUT_MS",
+                              10000, 1000, 600000);
 
   m_frame_size  = (SAMPLE_RATE * m_frame_ms) / 1000;
   if (m_frame_size == 0)
@@ -151,6 +154,7 @@ TGMixer::TGMixer(uint32_t tg, const Async::Config& cfg)
   // Hangover: keep a source "active" ~200 ms past its last audio so brief
   // gaps between packets do not flap the mix-minus-self routing.
   m_hangover_frames = (200 + m_frame_ms - 1) / m_frame_ms;
+  m_source_timeout_frames = (src_timeout_ms + m_frame_ms - 1) / m_frame_ms;
 
   m_full_encoder = makeEncoder();
   if (m_full_encoder != nullptr)
@@ -348,6 +352,10 @@ void TGMixer::onTick(Async::Timer*)
       {
         // Not enough buffered yet: treat as silence, decay hangover.
         if (src->active_hangover > 0) { src->active_hangover--; }
+        if (src->ring.empty() && (src->active_hangover == 0))
+        {
+          src->idle_frames++;
+        }
         continue;
       }
     }
@@ -388,9 +396,50 @@ void TGMixer::onTick(Async::Timer*)
       src->active_hangover--;
     }
 
+    // Track idle time for source pruning (a fully idle source can be
+    // dropped; receiving is driven by TG membership, not by being a
+    // source, so pruning never silences a listener).
+    if (has_audio)
+    {
+      src->idle_frames = 0;
+    }
+    else if (src->ring.empty() && (src->active_hangover == 0))
+    {
+      src->idle_frames++;
+    }
+    else
+    {
+      src->idle_frames = 0;
+    }
+
     if (src->active_hangover > 0)
     {
       frame_of[src] = pcm; // keep own pcm for mix-minus-self
+    }
+  }
+
+  // Prune sources that have been idle past the timeout. Safe at any time:
+  // a pruned source re-registers on its next packet, and listeners keep
+  // receiving because routing is by TG membership, not by source presence.
+  {
+    std::vector<std::string> dead;
+    for (auto& kv : m_sources)
+    {
+      if (kv.second->idle_frames > m_source_timeout_frames)
+      {
+        dead.push_back(kv.first);
+      }
+    }
+    for (const auto& id : dead)
+    {
+      destroySource(m_sources[id]);
+      m_sources.erase(id);
+    }
+    if (m_sources.empty())
+    {
+      // No contributors left: stop the clock until audio returns. The
+      // mixer object is kept and reused (reaped on client disconnect).
+      setTickEnabled(false);
     }
   }
 

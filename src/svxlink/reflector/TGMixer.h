@@ -176,6 +176,7 @@ class TGMixer : public sigc::trackable
       bool                  prebuffering = true;
       bool                  is_local = true;   // local client vs mesh source
       unsigned              active_hangover = 0; // frames since last audio
+      unsigned              idle_frames = 0;   // consecutive fully-idle frames
       std::vector<uint8_t>  cur_out;           // encoder output this frame
     };
 
@@ -186,6 +187,7 @@ class TGMixer : public sigc::trackable
     unsigned                          m_frame_size;    // samples per frame
     unsigned                          m_prebuf_size;   // samples before play
     unsigned                          m_hangover_frames;
+    unsigned                          m_source_timeout_frames; // idle->prune
     std::map<std::string, Source*>    m_sources;
     Async::AudioEncoder*              m_full_encoder = nullptr;
     Async::AudioEncoder*              m_local_encoder = nullptr;
