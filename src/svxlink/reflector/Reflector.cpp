@@ -72,6 +72,7 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 #include "Reflector.h"
 #include "ReflectorClient.h"
 #include "TGHandler.h"
+#include "TGMixer.h"
 #include "TrunkLink.h"
 #include <Log.h>
 #include "TwinLink.h"
@@ -293,6 +294,12 @@ Reflector::~Reflector(void)
   m_mqtt_status_timer.setEnable(false);
   delete m_mqtt;
   m_mqtt = nullptr;
+
+  for (auto& kv : m_tg_mixers)
+  {
+    delete kv.second;
+  }
+  m_tg_mixers.clear();
 
   delete m_http_server;
   m_http_server = 0;
@@ -1101,6 +1108,7 @@ void Reflector::clientDisconnected(Async::FramedTcpConnection *con,
   assert(it != m_client_con_map.end());
   ReflectorClient *client = (*it).second;
 
+  removeFromAllMixers(client);
   TGHandler::instance()->removeClient(client);
 
   if (!client->callsign().empty())
@@ -1419,11 +1427,16 @@ void Reflector::udpDatagramReceived(const IpAddress& addr, uint16_t port,
         {
           if (TGHandler::instance()->fullDuplexForTG(tg))
           {
-            // STEG 2: full-duplex per-TG mixing is not yet wired into the
-            // audio path. Until TGMixer lands we fall back to the legacy
-            // single-talker relay, so enabling DUPLEX_MODE=full does not
-            // change behaviour yet.
-            relaySingleTalkerAudio(client, tg, msg.audioData());
+            // Full-duplex: feed the audio into this TG's conference mixer.
+            // The mixer emits mixReady -> onMixReady() routes the mix back
+            // to the local clients. NOTE: mesh (trunk/satellite/twin)
+            // forwarding for full-duplex TGs is added in a later step.
+            TGMixer* mx = getOrCreateMixer(tg);
+            if (mx != nullptr)
+            {
+              mx->writeOpus(std::to_string(client->clientId()),
+                            msg.audioData());
+            }
           }
           else
           {
@@ -1598,6 +1611,75 @@ void Reflector::relaySingleTalkerAudio(ReflectorClient* client, uint32_t tg,
     }
   }
 } /* Reflector::relaySingleTalkerAudio */
+
+
+TGMixer* Reflector::getOrCreateMixer(uint32_t tg)
+{
+  auto it = m_tg_mixers.find(tg);
+  if (it != m_tg_mixers.end())
+  {
+    return it->second;
+  }
+  if (m_cfg == nullptr)
+  {
+    return nullptr;
+  }
+  TGMixer* mx = new TGMixer(tg, *m_cfg);
+  mx->mixReady.connect(mem_fun(*this, &Reflector::onMixReady));
+  m_tg_mixers[tg] = mx;
+  return mx;
+} /* Reflector::getOrCreateMixer */
+
+
+void Reflector::onMixReady(const MixResult& result)
+{
+  const TGHandler::ClientSet& clients =
+      TGHandler::instance()->clientsForTG(result.tg);
+  for (ReflectorClient* c : clients)
+  {
+    const std::string id = std::to_string(c->clientId());
+    auto pit = result.per_source.find(id);
+    if (pit != result.per_source.end())
+    {
+      // Active source -> personalised mix-minus-self.
+      if (!pit->second.empty())
+      {
+        MsgUdpAudio m(pit->second);
+        c->sendUdpMsg(m);
+      }
+    }
+    else if (!result.full.empty())
+    {
+      // Passive listener -> full mix.
+      MsgUdpAudio m(result.full);
+      c->sendUdpMsg(m);
+    }
+  }
+} /* Reflector::onMixReady */
+
+
+void Reflector::removeFromAllMixers(ReflectorClient* client)
+{
+  if (client == nullptr)
+  {
+    return;
+  }
+  const std::string id = std::to_string(client->clientId());
+  for (auto it = m_tg_mixers.begin(); it != m_tg_mixers.end(); )
+  {
+    TGMixer* mx = it->second;
+    mx->removeSource(id);
+    if (mx->sourceCount() == 0)
+    {
+      delete mx;
+      it = m_tg_mixers.erase(it);
+    }
+    else
+    {
+      ++it;
+    }
+  }
+} /* Reflector::removeFromAllMixers */
 
 
 void Reflector::onTalkerUpdated(uint32_t tg, ReflectorClient* old_talker,

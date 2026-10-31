@@ -90,6 +90,8 @@ class ReflectorMsg;
 class ReflectorUdpMsg;
 class RedisStore;
 class TwinLink;
+class TGMixer;
+struct MixResult;
 
 
 /****************************************************************************
@@ -499,6 +501,11 @@ class Reflector : public sigc::trackable
     // Handed-off inbound trunk connections mapped to their TrunkLink
     std::map<Async::FramedTcpConnection*, TrunkLink*>    m_trunk_inbound_map;
 
+    // Full-duplex per-TG conference mixers (only for TGs whose resolved
+    // DUPLEX_MODE is "full"). Created lazily on first audio, destroyed when
+    // their last source goes away.
+    std::map<uint32_t, TGMixer*>                         m_tg_mixers;
+
     // Twin HA-pair support
     TwinLink*                                            m_twin_link = nullptr;
     Async::TcpServer<Async::FramedTcpConnection>*        m_twin_srv = nullptr;
@@ -560,6 +567,23 @@ class Reflector : public sigc::trackable
      */
     void relaySingleTalkerAudio(ReflectorClient* client, uint32_t tg,
                                 const std::vector<uint8_t>& audio_data);
+    /**
+     * @brief   Get (creating if needed) the full-duplex mixer for a TG.
+     */
+    TGMixer* getOrCreateMixer(uint32_t tg);
+    /**
+     * @brief   Route one frame of mixed audio to the local clients on its TG.
+     *
+     * Active sources receive their personalised mix-minus-self stream; all
+     * other clients on the TG receive the full mix. (Mesh forwarding is
+     * handled separately.)
+     */
+    void onMixReady(const MixResult& result);
+    /**
+     * @brief   Drop a client from every mixer (e.g. on disconnect) and tear
+     *          down any mixer left with no sources.
+     */
+    void removeFromAllMixers(ReflectorClient* client);
     void onTalkerUpdated(uint32_t tg, ReflectorClient* old_talker,
                          ReflectorClient *new_talker);
     void httpRequestReceived(Async::HttpServerConnection *con,
