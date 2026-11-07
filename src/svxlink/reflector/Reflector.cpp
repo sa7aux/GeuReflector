@@ -509,6 +509,32 @@ bool Reflector::initialize(Async::Config &cfg)
 
   m_cfg->getValue("GLOBAL", "TG_FOR_V1_CLIENTS", m_tg_for_v1_clients);
 
+  // Which nodes may run full duplex. Full duplex is only safe on a node that
+  // can receive while transmitting: a repeater (separate RX/TX) or an
+  // Asterisk/trunk link. A SIMPLEX node (single frequency) can never, so it is
+  // treated half-duplex and is not streamed audio in the hang window after its
+  // own TX (otherwise it hears its own over looped back). FULL_DUPLEX_NODES is
+  // a regex of the callsigns that ARE full-duplex-capable; unset => every node
+  // half-duplex (safe default).
+  {
+    std::string fdx_nodes_re;
+    if (m_cfg->getValue("GLOBAL", "FULL_DUPLEX_NODES", fdx_nodes_re) &&
+        !fdx_nodes_re.empty())
+    {
+      try
+      {
+        m_full_duplex_node_re = std::regex(fdx_nodes_re);
+        m_full_duplex_node_re_set = true;
+      }
+      catch (const std::regex_error& e)
+      {
+        geulog::warn("core", "Invalid FULL_DUPLEX_NODES regex '", fdx_nodes_re,
+                     "': ", e.what(), " -- all nodes treated half-duplex");
+      }
+    }
+    m_cfg->getValue("GLOBAL", "HALF_DUPLEX_TX_HANG_MS", m_half_duplex_tx_hang_ms);
+  }
+
   SvxLink::SepPair<uint32_t, uint32_t> random_qsy_range;
   if (m_cfg->getValue("GLOBAL", "RANDOM_QSY_RANGE", random_qsy_range))
   {
@@ -1663,6 +1689,10 @@ void Reflector::udpDatagramReceived(const IpAddress& addr, uint16_t port,
           //     Distribution to clients + mesh is done by onMixReady(). ---
           if (TGHandler::instance()->fullDuplexForTG(tg))
           {
+            // Note when this client last transmitted on a full-duplex TG, so a
+            // half-duplex (simplex) client can be muted downstream in the hang
+            // window after its own TX (onMixReady) and never hear itself.
+            gettimeofday(&m_client_last_tx[client->clientId()], nullptr);
             const std::string fdx_id = "c:" + std::to_string(client->clientId());
             TGMixer* mx = getOrCreateMixer(tg);
             if (mx != nullptr)
@@ -2053,6 +2083,20 @@ void Reflector::feedMeshAudioToMixer(uint32_t tg, const std::string& srcid,
 } /* Reflector::feedMeshAudioToMixer */
 
 
+bool Reflector::isFullDuplexClient(ReflectorClient* client) const
+{
+  if (client == nullptr)
+  {
+    return false;
+  }
+  if (!m_full_duplex_node_re_set)
+  {
+    return false; // default: every node half-duplex (safe, no self-echo)
+  }
+  return std::regex_match(client->callsign(), m_full_duplex_node_re);
+} /* Reflector::isFullDuplexClient */
+
+
 void Reflector::onMixReady(const MixResult& result)
 {
   // --- Local clients: mix-minus-self to active sources, full mix to the
@@ -2062,6 +2106,26 @@ void Reflector::onMixReady(const MixResult& result)
       TGHandler::instance()->clientsForTG(result.tg);
   for (ReflectorClient* c : clients)
   {
+    // Half-duplex (simplex) client: do NOT stream it anything in the hang
+    // window after its own TX. A one-frequency node cannot receive while it
+    // transmits and must never get its own over looped back (directly or via
+    // the mesh round-trip). Full-duplex-capable nodes (repeater / Asterisk-
+    // trunk, per FULL_DUPLEX_NODES) are exempt and hear everything live.
+    if (!isFullDuplexClient(c))
+    {
+      auto lit = m_client_last_tx.find(c->clientId());
+      if (lit != m_client_last_tx.end())
+      {
+        struct timeval now;
+        gettimeofday(&now, nullptr);
+        long ms = (now.tv_sec  - lit->second.tv_sec)  * 1000L +
+                  (now.tv_usec - lit->second.tv_usec) / 1000L;
+        if ((ms >= 0) && (ms < static_cast<long>(m_half_duplex_tx_hang_ms)))
+        {
+          continue; // still in this simplex node's TX hang -> send nothing
+        }
+      }
+    }
     const std::string id = "c:" + std::to_string(c->clientId());
     auto pit = result.per_source.find(id);
     if (pit != result.per_source.end())

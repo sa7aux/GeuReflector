@@ -65,6 +65,21 @@ TG_FOR_V1_CLIENTS=999
 # frame. Higher = more jitter absorbed before a gap is heard. Default 300 ms.
 #MIX_REPREBUF_MS=300
 #
+# FULL_DUPLEX_NODES: regex of the node callsigns that may run FULL duplex, i.e.
+# nodes that can receive while transmitting -- a repeater (separate RX/TX), a
+# full-duplex-capable app client (e.g. DV with full duplex enabled) or an
+# Asterisk/trunk link. Those nodes hear the whole conference live, even while
+# transmitting (mix-minus-self). Every node NOT matched is treated HALF duplex:
+# it is heard by all, but is not streamed audio in the window right after its
+# own TX, so a simplex node (one frequency) never hears its own over looped
+# back. Unset => every node half-duplex (safe default). If all participants are
+# full duplex, everyone hears everyone simultaneously.
+#   Example: all SA7AUX repeaters + the DV client, but NOT the simplex nodes:
+#FULL_DUPLEX_NODES=^(SA7AUX-R.*|SA7AUX-DV|.*-TRUNK)$
+# HALF_DUPLEX_TX_HANG_MS: how long after a half-duplex node's own TX it is kept
+# muted downstream (covers the mesh round-trip of its own audio). Default 2000.
+#HALF_DUPLEX_TX_HANG_MS=2000
+#
 #HTTP_SRV_PORT=8080
 COMMAND_PTY=/dev/shm/reflector_ctrl
 #ACCEPT_CALLSIGN="[A-Z0-9][A-Z]{0,2}\\d[A-Z0-9]{0,3}[A-Z](?:-[A-Z0-9]{1,3})?"
