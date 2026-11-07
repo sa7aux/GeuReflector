@@ -24,10 +24,18 @@ LISTEN_PORT=5300
 #   MIX_MAX_TALKERS max simultaneously mixed talkers     (default 4,  1-32)
 #   MIX_SOURCE_TIMEOUT_MS  drop an idle source after this long
 #                                           (default 10000, 1000-600000)
+#   MIX_HANGOVER_MS how long a source stays "active" past its last audio
+#                   (default 500, 0-5000). Prevents TalkerStop/Start flapping
+#                   on a steady but jittery source (trunk/bridge, uneven node).
+#   MIX_REPREBUF_MS only rebuild the jitter buffer (a prebuffer of silence)
+#                   after this long of a SUSTAINED outage, not on every late
+#                   frame (default 300, 20-2000). Absorbs transient jitter.
 #MIX_FRAME_MS=20
 #MIX_JITTER_MS=60
 #MIX_MAX_TALKERS=4
 #MIX_SOURCE_TIMEOUT_MS=10000
+#MIX_HANGOVER_MS=500
+#MIX_REPREBUF_MS=300
 # QSY (change talk group) behaviour. All keys are global defaults here and
 # are overridable per talk group in a [TG#<n>] section.
 #   AUTO_QSY        1/0 — enable automatic idle QSY. When unset the legacy
