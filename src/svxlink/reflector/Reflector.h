@@ -364,11 +364,6 @@ class Reflector : public sigc::trackable
                               const std::vector<uint8_t>& audio,
                               const std::string& callsign = "");
 
-    // True only for full-duplex-capable clients (repeater / Asterisk-trunk),
-    // i.e. callsigns matching FULL_DUPLEX_NODES. A simplex node returns false
-    // and is handled half-duplex (never streamed its own audio back).
-    bool isFullDuplexClient(ReflectorClient* client) const;
-
     /**
      * Resolve the HMAC secret to verify a satellite's MsgPeerHello.
      *
@@ -525,20 +520,6 @@ class Reflector : public sigc::trackable
     // over a trunk/bridge, so a node never hears itself (incl. simplex nodes
     // that would otherwise get the delayed echo after releasing PTT).
     std::map<uint32_t, std::string> m_trunk_talker;
-    // Full-duplex is only safe on nodes that can receive while transmitting:
-    // repeaters (separate RX/TX) and Asterisk/trunk links. A SIMPLEX node (one
-    // frequency) can NEVER do full duplex, so it must never be streamed audio
-    // while/just after it transmits, or it hears its own over looped back.
-    // m_full_duplex_node_re matches the callsigns that ARE full-duplex-capable
-    // (FULL_DUPLEX_NODES); everyone else is treated half-duplex. Default: no
-    // match -> every node half-duplex (safe, no self-echo).
-    std::regex   m_full_duplex_node_re;
-    bool         m_full_duplex_node_re_set = false;
-    unsigned     m_half_duplex_tx_hang_ms = 2000;
-    // Last time each client fed audio into a full-duplex TG mixer. Used to gate
-    // downstream delivery to half-duplex clients for the hang window after
-    // their own TX (so a simplex node never gets its own audio back).
-    std::map<ReflectorClient::ClientId, struct timeval> m_client_last_tx;
     // Prefix bookkeeping for owner-relay decisions. m_local_prefixes holds
     // prefixes owned by this reflector (from GLOBAL/LOCAL_PREFIX);
     // m_all_prefixes is local + every peer's REMOTE_PREFIX. Populated in
